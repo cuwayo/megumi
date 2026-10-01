@@ -1,4 +1,5 @@
 pub mod console;
+pub mod download;
 pub mod echo;
 pub mod group;
 pub mod help;
@@ -9,6 +10,7 @@ pub mod sticker;
 pub mod uptime;
 
 pub use console::console;
+pub use download::download;
 pub use echo::echo;
 pub use group::group;
 pub use help::help;
@@ -41,7 +43,11 @@ pub mod utility {}
 #[group(
     description = "Media conversion",
     context = crate::Context,
-    commands(crate::commands::sticker, crate::commands::shazam)
+    commands(
+        crate::commands::sticker,
+        crate::commands::shazam,
+        crate::commands::download,
+    )
 )]
 pub mod media {}
 

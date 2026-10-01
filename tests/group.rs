@@ -1,5 +1,5 @@
 use megumi::ChoiceParameter;
-use megumi_whatsapp::commands::group::{Audience, Ephemeral, Toggle, render_info};
+use megumi_whatsapp::commands::group::{Audience, Ephemeral, Toggle, render_info, render_info_with};
 use whatsapp_rust::{GroupEphemeralSettings, GroupMetadata, MemberAddMode};
 
 #[test]
@@ -60,6 +60,10 @@ fn info_lists_the_settings_an_admin_checks_first() {
     assert!(text.contains("New members: need approval"), "{text}");
     assert!(text.contains("Who can add members: admins"), "{text}");
     assert!(text.contains("Disappearing messages: 24 hours"), "{text}");
+    assert!(
+        !text.contains("Morning news"),
+        "the digest line only appears when the setting is known: {text}"
+    );
 }
 
 #[test]
@@ -70,4 +74,13 @@ fn info_without_a_name_or_description_is_still_readable() {
     assert!(text.contains("0 members"), "{text}");
     assert!(text.contains("Messages: everyone"), "{text}");
     assert!(text.contains("Disappearing messages: off"), "{text}");
+}
+
+#[test]
+fn info_reports_whether_the_morning_digest_is_on() {
+    let on = render_info_with(&GroupMetadata::default(), Some(true));
+    assert!(on.contains("Morning news: on"), "{on}");
+
+    let off = render_info_with(&GroupMetadata::default(), Some(false));
+    assert!(off.contains("Morning news: off"), "{off}");
 }

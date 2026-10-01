@@ -82,7 +82,7 @@ fn group_and_its_subcommands_are_registered() {
     let parent = framework.command_help("group").unwrap();
     assert!(parent.contains("groups only"), "{parent}");
     assert!(parent.contains("Admin"), "{parent}");
-    for subcommand in ["info", "subject", "promote", "kick", "requests"] {
+    for subcommand in ["info", "subject", "promote", "kick", "requests", "news"] {
         assert!(
             parent.contains(subcommand),
             "`{subcommand}` missing from group help: {parent}"

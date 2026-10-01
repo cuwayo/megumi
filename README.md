@@ -103,6 +103,7 @@ admins. A bare `!group` tells you it needs a subcommand.
 | `!group addmode <all\|admins>` | Sets who can add new members |
 | `!group linkmode <all\|admins>` | Sets who can share the invite link |
 | `!group approval <on\|off>` | Sets whether an admin must approve new members |
+| `!group news <on\|off>` | Sets whether the group gets a news digest each morning |
 | `!group link` | Shows the invite link |
 | `!group resetlink` | Revokes the invite link and shows the new one |
 | `!group add @member` | Adds members (tag them, reply to one, or type a number) |
@@ -112,6 +113,12 @@ admins. A bare `!group` tells you it needs a subcommand.
 | `!group requests` | Lists who is waiting for approval to join |
 | `!group approve @member` | Approves pending join requests |
 | `!group reject @member` | Rejects pending join requests |
+
+`!group news on` subscribes the group to a short digest of headlines, posted once
+each morning at 07:00 in the machine's local time. The headlines come from RSS:
+BBC News, BBC World, and The Guardian's world desk. `!group news off` stops
+them. The subscription is remembered across restarts, and a morning that already
+went out is not sent again.
 
 ### Owner
 
@@ -131,6 +138,8 @@ optional; without the file the bot runs with sticker-pack conversion disabled.
 | `TELEGRAM_BOT_TOKEN` | unset | Enables `!sticker` for Telegram sticker packs |
 | `TELEGRAM_API_BASE` | `https://api.telegram.org` | Override for a proxy or a local Bot API server |
 | `RUST_LOG` | unset | Tracing filter, e.g. `megumi=info` to see command outcomes |
+| `NEWS_DB` | `news.json` | Where group news subscriptions are stored |
+| `NEWS_HOUR` | `7` | Local hour the morning digest is sent at |
 
 ## Development
 

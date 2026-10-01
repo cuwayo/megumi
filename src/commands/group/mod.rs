@@ -30,6 +30,7 @@ use whatsapp_rust::{
         addmode,
         linkmode,
         approval,
+        news,
         link,
         resetlink,
         promote,
@@ -50,7 +51,9 @@ async fn group(ctx: Context) -> Result<(), Error> {
 #[command(name = "info")]
 async fn info(ctx: Context) -> Result<(), Error> {
     let metadata = fetch_metadata(&ctx).await?;
-    ctx.say(render_info(&metadata)).await
+    // A failure to read the setting should not hide the rest of the group's info.
+    let news = ctx.data().news.is_enabled(&chat(&ctx).to_string()).ok();
+    ctx.say(render_info_with(&metadata, news)).await
 }
 
 /// Renames the group.
@@ -214,6 +217,27 @@ async fn approval(ctx: Context, setting: Toggle) -> Result<(), Error> {
         "New members now need an admin's approval."
     } else {
         "New members can join without approval."
+    };
+    ctx.say(reply).await
+}
+
+/// Sets whether this group gets a news digest each morning.
+#[command(name = "news")]
+async fn news(ctx: Context, setting: Toggle) -> Result<(), Error> {
+    let enabled = setting.enabled();
+    let chat = chat(&ctx).to_string();
+
+    let changed = ctx
+        .data()
+        .news
+        .set_enabled(&chat, enabled)
+        .map_err(|error| format!("Failed to save the news setting: {error}"))?;
+
+    let reply = match (enabled, changed) {
+        (true, true) => "Morning news is on. This group will get a digest each morning.",
+        (true, false) => "Morning news is already on for this group.",
+        (false, true) => "Morning news is off. This group will no longer get a digest.",
+        (false, false) => "Morning news is already off for this group.",
     };
     ctx.say(reply).await
 }
@@ -549,7 +573,15 @@ impl Audience {
 }
 
 /// The settings an admin checks first, one line each.
+///
+/// `news` is this bot's own setting rather than one WhatsApp stores, so it is
+/// reported separately from the metadata.
 pub fn render_info(metadata: &GroupMetadata) -> String {
+    render_info_with(metadata, None)
+}
+
+/// [`render_info`] plus whether the morning digest is on, when that is known.
+pub fn render_info_with(metadata: &GroupMetadata, news: Option<bool>) -> String {
     let mut lines = Vec::new();
 
     lines.push(format!(
@@ -599,6 +631,12 @@ pub fn render_info(metadata: &GroupMetadata) -> String {
         "Disappearing messages: {}",
         ephemeral_label(metadata.ephemeral.as_ref().map(expiration).unwrap_or(0))
     ));
+    if let Some(enabled) = news {
+        lines.push(format!(
+            "Morning news: {}",
+            if enabled { "on" } else { "off" }
+        ));
+    }
 
     lines.join("\n")
 }

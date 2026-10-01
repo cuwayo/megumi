@@ -1,0 +1,24 @@
+# Build output
+/target
+
+# The linked WhatsApp account's session. Never commit it.
+whatsapp.db*
+
+# Secrets. .env.example is the committed template.
+.env
+.env.*
+!.env.example
+
+# rustfmt and rust-analyzer
+**/*.rs.bk
+.cargo/config.toml.bak
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db

@@ -1,0 +1,99 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A WhatsApp bot built on [`whatsapp-rust`](https://github.com/oxidezap/whatsapp-rust), plus a command layer
+(`megumi-framework`) whose design is ported from [Poise](https://github.com/serenity-rs/poise). The port is
+deliberately WhatsApp-shaped: a **WhatsApp group is Poise's guild**, a message from the bot's own account
+(`is_from_me`) is the **owner**, and there is no slash-command/autocomplete/modal layer.
+
+## Commands
+
+```bash
+cargo test --workspace          # build macros + framework + bot, run every test
+cargo test -p megumi-framework --lib              # framework unit tests only
+cargo test -p megumi-framework --test command_macro   # one integration test binary
+cargo test -p megumi-framework --test command_macro typed_parameters_are_advertised   # one test
+cargo clippy --workspace --all-targets
+cargo fmt --all
+cargo run                       # starts the bot; prints a QR code to scan on first run
+```
+
+Run the bot needs a `.env` (see `.env.example`). `TELEGRAM_BOT_TOKEN` is only needed by the Telegram
+sticker-pack path of `!sticker`. `whatsapp.db*` is the SQLite session store, gitignored.
+
+Test binaries in `crates/megumi-framework/tests/` exercise the `#[command]` macro expansion directly and are
+the fastest way to check macro changes. Tests in the repo-root `tests/` drive the **real** bot registry via
+`megumi_whatsapp::framework()`, so adding a command there is what makes `routing.rs` pass.
+
+Some sticker tests shell out to `ffmpeg`; they are the slow ones (seconds, not milliseconds).
+
+## Workspace layout
+
+Three crates, all `edition = "2024"`, `resolver = "3"`:
+
+- `crates/megumi-framework-macros` — the `#[command]` / `#[group]` proc macros. `command.rs` parses attributes
+  and emits a `RegisteredCommand`; `signature.rs` turns the function signature into argument bindings.
+- `crates/megumi-framework` — the library. **Its lib name is `megumi`**, so the bot depends on it as
+  `megumi = { package = "megumi-framework", ... }`. Public API is re-exported from `lib.rs`.
+- repo root — the bot binary (`src/main.rs`), its commands (`src/commands/<name>/mod.rs`), and integration tests.
+
+The proc macros expand against `::megumi::__private::{RegisteredCommand, GroupDescriptor}` and
+`::megumi::{PopArgument, Args, Context, ...}`. Changing a type those paths name means the **macro crate and
+the framework must be rebuilt together** — `cargo test --workspace` does this; a lone `cargo check -p megumi`
+can report stale errors against an old expansion.
+
+## Command layer architecture
+
+`Command` (framework) and `RegisteredCommand` (macro output) carry the same metadata fields; `IntoCommand`
+converts one to the other. When you add a field to `Command`, add it to `RegisteredCommand`, to
+`RegisteredCommand::into_command`, and emit it from `expand_command` in the macro crate — the three must stay
+in sync or every command stops compiling.
+
+`Context`, `Command`, `Framework`, and `FrameworkBuilder` are all generic over user data `U`
+(Poise's `U`), defaulting to `NoData`. A command written against `ctx: Context` stays
+`RegisteredCommand<NoData>`; a bot that shares state aliases `type Context = megumi::Context<Data>`
+and calls `Framework::builder().setup(|| Data { ... })` **before** registering commands. The macro
+projects `U` via `_GetGenerics` from the first parameter's type. `setup` panics if commands were
+already added, because a `Command<NoData>` cannot become a `Command<Data>`.
+
+Dispatch (`Framework::handle` → `Command::invoke`) runs in this order:
+
+1. strip a configured prefix, look the name up in the alias map (only **top-level** commands are registered)
+2. descend into `subcommands` for as long as the next word names a child; `subcommand_required` errors here
+3. gates: `guild_only`/`dm_only`, permission (owner/group-admin), framework `command_check`, the command's own
+   `checks`, then cooldown **consult**
+4. `react` on the invoking message, `pre_command` hook
+5. the command body, which parses its own typed arguments and calls `start_cooldown` **after** parsing
+   (a mistyped invocation must not burn a cooldown)
+6. on `Ok`, `post_command`; the reaction is removed either way
+
+Errors never reply inline: `Command::invoke` returns a `FrameworkError`, and the dispatcher hands it to the
+command's `on_error` or the framework's. The default handler answers the chat quoting the offending message.
+
+### Argument parsing
+
+A command parameter that is not `Context` or `Args` is popped off the front of the message via `PopArgument`
+(sync — unlike Poise, nothing needs a network round-trip). `#[rest]` consumes the remainder and must be last;
+a bare `&str` immediately after an `Args` parameter is treated as `#[rest]` too, for backward compatibility.
+`#[flag]` is a boolean that is true when the user typed the parameter's name.
+
+`#[command(subcommands(...))]` takes **idents**, not string literals: `subcommands(get, set)`.
+
+## WhatsApp-specific constraints the framework encodes
+
+- A WhatsApp message carries **one** media payload. `CreateReply` attaching a second replaces the first;
+  text plus a sticker/audio attachment is refused rather than silently dropped.
+- Editing is text-to-text only. `reuse_response` stores the first reply's id and edits it, but an attachment
+  falls back to sending a new message (see `CreateReply::edit`).
+- `Context::attachment()` reads the message itself or the message it quotes; `Context::download` fetches bytes.
+- `!sticker` converts media locally with `ffmpeg`; its transcode path steps quality/frame-rate down to fit
+  WhatsApp's 100 KB still / 500 KB animated sticker limits (`src/commands/sticker/transcode.rs`).
+
+## Adding a command
+
+Create `src/commands/<name>/mod.rs` with an `async fn` returning `Result<(), megumi::Error>`, add the module
+and a `pub use` to `src/commands/mod.rs`, then add it to `commands([...])` in `src/lib.rs::framework()`.
+`README.md` documents every supported `#[command]` attribute and is the reference for what the macro accepts.

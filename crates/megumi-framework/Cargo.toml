@@ -1,0 +1,16 @@
+[package]
+name = "megumi-framework"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "megumi"
+
+[dependencies]
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "c65b4028ace77da161824d95530e2b002b9ec332" }
+megumi-framework-macros = { path = "../megumi-framework-macros" }
+tracing = { version = "0.1.44", features = ["async-await", "attributes"] }
+itertools = "0.15.0"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["full"] }

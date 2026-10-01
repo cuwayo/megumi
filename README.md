@@ -29,6 +29,8 @@ group administration, and it ships with a reusable command framework modelled on
 
 - [Rust](https://rustup.rs) (edition 2024 — a recent stable toolchain)
 - [ffmpeg](https://ffmpeg.org) on `PATH` — used by `!sticker` and `!shazam`
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) on `PATH` — used by `!download`.
+  `ffmpeg` is what it uses to merge video and audio into one file.
 - A Telegram bot token, only if you want `!sticker` to convert Telegram sticker
   packs. Get one from [@BotFather](https://t.me/BotFather).
 
@@ -69,10 +71,17 @@ shows a command's own usage and description.
 | --- | --- | --- |
 | `!sticker [url]` | `stiker` | Converts an image, video, GIF, or URL into a sticker |
 | `!shazam [url]` | `sz` | Recognises a song from an audio or video clip |
+| `!download <url>` | `dl`, `ytdl` | Downloads a video and sends it back |
 
 For `!sticker` and `!shazam`, reply to a message that contains the media, send
 the command as the media's caption, or pass a public URL. Extra words in a
 caption are ignored, so `!sticker please` still works.
+
+`!download <url>` fetches the video at an http or https address with `yt-dlp`
+and sends it back. Nothing over 100 MB is downloaded. A video up to 64 MB is
+sent as a playable video; a larger one is sent as a document instead, which
+WhatsApp accepts at a much higher size. Playlists are not downloaded — only
+the video the address points at.
 
 `!sticker <t.me/addstickers/...>` converts a Telegram sticker pack into one or
 more WhatsApp packs of at most 60 stickers each. An optional second argument

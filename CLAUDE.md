@@ -24,7 +24,8 @@ cargo run                       # starts the bot; prints a QR code to scan on fi
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --all --check` with nightly rustfmt and
 `cargo clippy --workspace --all-targets -- -D warnings`.
 
-Running the bot needs `ffmpeg` on `PATH` (`!sticker` and `!shazam` shell out to it) and a `.env`
+Running the bot needs `ffmpeg` on `PATH` (`!sticker` and `!shazam` shell out to it),
+`yt-dlp` on `PATH` (`!download` shells out to it; it merges with `ffmpeg`), and a `.env`
 (see `.env.example`). Every variable is optional: `TELEGRAM_BOT_TOKEN` enables the Telegram
 sticker-pack path of `!sticker`, `TELEGRAM_API_BASE` overrides the Telegram API host, and
 `RUST_LOG` sets the tracing filter (the default is `megumi=info,whatsapp_rust=info,warn`).
@@ -114,8 +115,11 @@ groups commands under. Each group's `context = crate::Context` is how the macro 
 
 - `utility` — `help`, `ping`, `echo`, `uptime`, `scihub`. `!scihub` resolves a DOI (bare, `doi.org`, or
   Sci-Hub URL) or a title against the Crossref API and replies with a Sci-Hub link.
-- `media` — `sticker`, `shazam`. Both take their input from a quoted message, the command's own caption, or a
-  URL, and ignore spare words in a caption. `!shazam` transcodes to 16 kHz mono PCM with `ffmpeg`,
+- `media` — `sticker`, `shazam`, `download`. The first two take their input from a quoted message, the
+  command's own caption, or a URL, and ignore spare words in a caption. `!download <url>` fetches the video
+  at an http(s) address with `yt-dlp` (`src/commands/download/`) and sends it back. `yt-dlp` is told to
+  refuse anything over 100 MB (`MAX_DOWNLOAD`); what comes back is sent as a playable video up to 64 MB and
+  as a document past that. `!shazam` transcodes to 16 kHz mono PCM with `ffmpeg`,
   fingerprints it locally (`src/commands/shazam/fingerprint.rs`), and recognises it against Shazam.
   `!sticker <t.me/addstickers/...>` converts a Telegram sticker pack into WhatsApp packs of at most 60
   stickers; that path is the only one needing `TELEGRAM_BOT_TOKEN`.

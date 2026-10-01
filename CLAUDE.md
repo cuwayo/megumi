@@ -17,12 +17,18 @@ cargo test -p megumi-framework --lib              # framework unit tests only
 cargo test -p megumi-framework --test command_macro   # one integration test binary
 cargo test -p megumi-framework --test command_macro typed_parameters_are_advertised   # one test
 cargo clippy --workspace --all-targets
-cargo fmt --all
+cargo +nightly fmt --all        # CI pins rustfmt to nightly; stable fmt will disagree
 cargo run                       # starts the bot; prints a QR code to scan on first run
 ```
 
-Run the bot needs a `.env` (see `.env.example`). `TELEGRAM_BOT_TOKEN` is only needed by the Telegram
-sticker-pack path of `!sticker`. `whatsapp.db*` is the SQLite session store, gitignored.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all --check` with nightly rustfmt and
+`cargo clippy --workspace --all-targets -- -D warnings`.
+
+Running the bot needs `ffmpeg` on `PATH` (`!sticker` and `!shazam` shell out to it) and a `.env`
+(see `.env.example`). Every variable is optional: `TELEGRAM_BOT_TOKEN` enables the Telegram
+sticker-pack path of `!sticker`, `TELEGRAM_API_BASE` overrides the Telegram API host, and
+`RUST_LOG` sets the tracing filter (the default is `megumi=info,whatsapp_rust=info,warn`).
+`whatsapp.db*` is the SQLite session store, gitignored.
 
 Test binaries in `crates/megumi-framework/tests/` exercise the `#[command]` macro expansion directly and are
 the fastest way to check macro changes. Tests in the repo-root `tests/` drive the **real** bot registry via
@@ -34,13 +40,14 @@ Some sticker tests shell out to `ffmpeg`; they are the slow ones (seconds, not m
 
 Three crates, all `edition = "2024"`, `resolver = "3"`:
 
-- `crates/megumi-framework-macros` — the `#[command]` / `#[group]` proc macros. `command.rs` parses attributes
-  and emits a `RegisteredCommand`; `signature.rs` turns the function signature into argument bindings.
+- `crates/megumi-framework-macros` — the `#[command]` / `#[group]` / `#[derive(ChoiceParameter)]` proc macros.
+  `command.rs` parses attributes and emits a `RegisteredCommand`; `signature.rs` turns the function signature
+  into argument bindings; `choice_parameter.rs` turns an enum's variants into the words it accepts.
 - `crates/megumi-framework` — the library. **Its lib name is `megumi`**, so the bot depends on it as
   `megumi = { package = "megumi-framework", ... }`. Public API is re-exported from `lib.rs`.
 - repo root — the bot binary (`src/main.rs`), its commands (`src/commands/<name>/mod.rs`), and integration tests.
 
-The proc macros expand against `::megumi::__private::{RegisteredCommand, GroupDescriptor}` and
+The proc macros expand against `::megumi::__private::{RegisteredCommand, GroupDescriptor, ChoicesOf}` and
 `::megumi::{PopArgument, Args, Context, ...}`. Changing a type those paths name means the **macro crate and
 the framework must be rebuilt together** — `cargo test --workspace` does this; a lone `cargo check -p megumi`
 can report stale errors against an old expansion.
@@ -78,22 +85,53 @@ command's `on_error` or the framework's. The default handler answers the chat qu
 A command parameter that is not `Context` or `Args` is popped off the front of the message via `PopArgument`
 (sync — unlike Poise, nothing needs a network round-trip). `#[rest]` consumes the remainder and must be last;
 a bare `&str` immediately after an `Args` parameter is treated as `#[rest]` too, for backward compatibility.
-`#[flag]` is a boolean that is true when the user typed the parameter's name.
+`#[flag]` is a boolean that is true when the user typed the parameter's name. `#[lazy]` defers parsing of one
+parameter; it cannot combine with `#[rest]` or `#[flag]`.
 
-`#[command(subcommands(...))]` takes **idents**, not string literals: `subcommands(get, set)`.
+An enum deriving `ChoiceParameter` is a parameter whose accepted words are its variants. The macro advertises
+those choices through `__private::ChoicesOf`, which resolves to the enum's `list()` only for types that
+implement the trait and to nothing otherwise — that resolution trick is why a new parameter type needs no
+registration.
+
+`#[command(subcommands(...))]` takes **idents**, not string literals: `subcommands(get, set)`. A subcommand
+inherits its parent's checks, permission, and chat-type restriction, so those are declared once on the parent.
 
 ## WhatsApp-specific constraints the framework encodes
 
 - A WhatsApp message carries **one** media payload. `CreateReply` attaching a second replaces the first;
-  text plus a sticker/audio attachment is refused rather than silently dropped.
+  text plus a sticker/audio attachment is refused rather than silently dropped. A link preview is dropped
+  when media is attached, but a `link_card` survives an attachment and replaces a link preview.
 - Editing is text-to-text only. `reuse_response` stores the first reply's id and edits it, but an attachment
   falls back to sending a new message (see `CreateReply::edit`).
 - `Context::attachment()` reads the message itself or the message it quotes; `Context::download` fetches bytes.
 - `!sticker` converts media locally with `ffmpeg`; its transcode path steps quality/frame-rate down to fit
   WhatsApp's 100 KB still / 500 KB animated sticker limits (`src/commands/sticker/transcode.rs`).
 
+## The bot's commands
+
+`src/lib.rs::framework()` registers four `#[group]`s defined in `src/commands/mod.rs`, which is what `!help`
+groups commands under. Each group's `context = crate::Context` is how the macro learns the bot's `Data` type.
+
+- `utility` — `help`, `ping`, `echo`, `uptime`, `scihub`. `!scihub` resolves a DOI (bare, `doi.org`, or
+  Sci-Hub URL) or a title against the Crossref API and replies with a Sci-Hub link.
+- `media` — `sticker`, `shazam`. Both take their input from a quoted message, the command's own caption, or a
+  URL, and ignore spare words in a caption. `!shazam` transcodes to 16 kHz mono PCM with `ffmpeg`,
+  fingerprints it locally (`src/commands/shazam/fingerprint.rs`), and recognises it against Shazam.
+  `!sticker <t.me/addstickers/...>` converts a Telegram sticker pack into WhatsApp packs of at most 60
+  stickers; that path is the only one needing `TELEGRAM_BOT_TOKEN`.
+- `admin` — `group`, whose subcommands rename the group, change its settings, and manage members. The parent
+  declares `guild_only`, `permission = GroupAdmin`, and `subcommand_required`, so its body never runs and
+  every child inherits the gates. Settings that take a fixed set of words (`announce`, `ephemeral`,
+  `addmode`, …) parse them with `ChoiceParameter` enums.
+- `owner` — `console` (alias `sh`), `permission = Owner` and `hide_in_help`. It runs the rest of the message
+  under `sh -c` with a 10 s timeout and replies with the tail of the output.
+
+`Data` (in `src/data.rs`) holds only the process start time, pinned in `framework()` so `!uptime` measures
+the whole run. `main` builds the framework before connecting, so that instant precedes the first command.
+
 ## Adding a command
 
 Create `src/commands/<name>/mod.rs` with an `async fn` returning `Result<(), megumi::Error>`, add the module
-and a `pub use` to `src/commands/mod.rs`, then add it to `commands([...])` in `src/lib.rs::framework()`.
+and a `pub use` to `src/commands/mod.rs`, then add it to the `commands(...)` of the `#[group]` it belongs to
+in that same file. The group's `description` is the heading it appears under in `!help`.
 `README.md` documents every supported `#[command]` attribute and is the reference for what the macro accepts.

@@ -14,7 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to nightly so the check stays put instead of moving whenever
+      # a new stable release ships a rustfmt change. Match it locally with
+      # `cargo +nightly fmt`.
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
       - name: Check formatting

@@ -218,7 +218,6 @@ mod tests {
         assert_eq!(jpeg_size(&[0x89, 0x50, 0x4E, 0x47]), None);
         assert_eq!(jpeg_size(&[]), None);
     }
-
 }
 
 /// The CDN references of a full-size thumbnail, once it has been uploaded.

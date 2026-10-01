@@ -2,7 +2,7 @@
 
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org)
-[![CI](https://github.com/cuwayo/megumi/actions/workflows/ci.yml/badge.svg)](https://github.com/cuwayo/megumi/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/cuwayo/megumi/ci.yml?branch=main&label=CI)](https://github.com/cuwayo/megumi/actions/workflows/ci.yml)
 
 A WhatsApp bot for groups and DMs, built on
 [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust). It answers `!`-prefixed

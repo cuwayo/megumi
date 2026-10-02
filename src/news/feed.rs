@@ -273,13 +273,11 @@ fn named_entity(name: &str) -> Option<char> {
 }
 
 fn numeric_entity(entity: &str) -> Option<char> {
-    let (digits, radix) = entity
-        .strip_prefix('#')
-        .map(|digits| {
-            digits
-                .strip_prefix(['x', 'X'])
-                .map_or((digits, 10), |hex| (hex, 16))
-        })?;
+    let (digits, radix) = entity.strip_prefix('#').map(|digits| {
+        digits
+            .strip_prefix(['x', 'X'])
+            .map_or((digits, 10), |hex| (hex, 16))
+    })?;
     char::from_u32(u32::from_str_radix(digits, radix).ok()?)
 }
 

@@ -1,5 +1,7 @@
 use megumi::ChoiceParameter;
-use megumi_whatsapp::commands::group::{Audience, Ephemeral, Toggle, render_info, render_info_with};
+use megumi_whatsapp::commands::group::{
+    Audience, Ephemeral, Toggle, render_info, render_info_with,
+};
 use whatsapp_rust::{GroupEphemeralSettings, GroupMetadata, MemberAddMode};
 
 #[test]

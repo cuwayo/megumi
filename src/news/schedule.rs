@@ -59,6 +59,9 @@ mod tests {
             Some("2026-10-05".to_string()),
             "the hour itself counts"
         );
-        assert!(morning_of(at(23, 30)).is_some(), "the rest of the day counts");
+        assert!(
+            morning_of(at(23, 30)).is_some(),
+            "the rest of the day counts"
+        );
     }
 }

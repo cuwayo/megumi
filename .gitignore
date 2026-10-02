@@ -4,6 +4,9 @@
 # The linked WhatsApp account's session. Never commit it.
 whatsapp.db*
 
+# Which groups subscribed to the morning digest, and which mornings went out.
+news.json*
+
 # Secrets. .env.example is the committed template.
 .env
 .env.*

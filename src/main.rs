@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use qrcode::render::unicode;
 use tracing::{info, instrument};
 use tracing_subscriber::EnvFilter;
@@ -19,11 +21,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = SqliteStore::new("whatsapp.db").await?;
     let framework = framework();
+    let data = framework.user_data().clone();
+    // The digest loop a connection started, so a reconnect can stop it before
+    // starting its replacement. `Connected` fires again on every reconnect, and
+    // the loop runs forever, so without this each reconnect would leave another
+    // loop running beside the new one.
+    let news_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
 
     let bot = Bot::builder()
         .with_backend(store)
-        .on_connected(|_client| async move {
-            info!("Connected with WhatsApp");
+        .on_connected(move |client| {
+            let data = data.clone();
+            let news_task = news_task.clone();
+            async move {
+                info!("Connected with WhatsApp");
+                // Stop the previous connection's loop and wait for it to be gone
+                // before starting the new one, so only one ever runs. A morning
+                // already delivered is recorded on disk, so restarting the loop
+                // does not resend it.
+                let mut task = news_task.lock().await;
+                if let Some(previous) = task.take() {
+                    previous.abort();
+                    let _ = previous.await;
+                }
+                *task = Some(tokio::spawn(megumi_whatsapp::news::run(client, data)));
+            }
         })
         .on_qr_code(|code, timeout| async move {
             let qr = qrcode::QrCode::new(code).expect("WhatsApp QR payload should encode");

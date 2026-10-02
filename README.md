@@ -29,6 +29,8 @@ group administration, and it ships with a reusable command framework modelled on
 
 - [Rust](https://rustup.rs) (edition 2024 — a recent stable toolchain)
 - [ffmpeg](https://ffmpeg.org) on `PATH` — used by `!sticker` and `!shazam`
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) on `PATH` — used by `!download`.
+  `ffmpeg` is what it uses to merge video and audio into one file.
 - A Telegram bot token, only if you want `!sticker` to convert Telegram sticker
   packs. Get one from [@BotFather](https://t.me/BotFather).
 
@@ -69,10 +71,17 @@ shows a command's own usage and description.
 | --- | --- | --- |
 | `!sticker [url]` | `stiker` | Converts an image, video, GIF, or URL into a sticker |
 | `!shazam [url]` | `sz` | Recognises a song from an audio or video clip |
+| `!download <url>` | `dl`, `ytdl` | Downloads a video and sends it back |
 
 For `!sticker` and `!shazam`, reply to a message that contains the media, send
 the command as the media's caption, or pass a public URL. Extra words in a
 caption are ignored, so `!sticker please` still works.
+
+`!download <url>` fetches the video at an http or https address with `yt-dlp`
+and sends it back. Nothing over 100 MB is downloaded. A video up to 64 MB is
+sent as a playable video; a larger one is sent as a document instead, which
+WhatsApp accepts at a much higher size. Playlists are not downloaded — only
+the video the address points at.
 
 `!sticker <t.me/addstickers/...>` converts a Telegram sticker pack into one or
 more WhatsApp packs of at most 60 stickers each. An optional second argument
@@ -94,6 +103,7 @@ admins. A bare `!group` tells you it needs a subcommand.
 | `!group addmode <all\|admins>` | Sets who can add new members |
 | `!group linkmode <all\|admins>` | Sets who can share the invite link |
 | `!group approval <on\|off>` | Sets whether an admin must approve new members |
+| `!group news <on\|off>` | Sets whether the group gets a news digest each morning |
 | `!group link` | Shows the invite link |
 | `!group resetlink` | Revokes the invite link and shows the new one |
 | `!group add @member` | Adds members (tag them, reply to one, or type a number) |
@@ -103,6 +113,12 @@ admins. A bare `!group` tells you it needs a subcommand.
 | `!group requests` | Lists who is waiting for approval to join |
 | `!group approve @member` | Approves pending join requests |
 | `!group reject @member` | Rejects pending join requests |
+
+`!group news on` subscribes the group to a short digest of headlines, posted once
+each morning at 07:00 in the machine's local time. The headlines come from RSS:
+BBC News, BBC World, and The Guardian's world desk. `!group news off` stops
+them. The subscription is remembered across restarts, and a morning that already
+went out is not sent again.
 
 ### Owner
 
@@ -122,6 +138,8 @@ optional; without the file the bot runs with sticker-pack conversion disabled.
 | `TELEGRAM_BOT_TOKEN` | unset | Enables `!sticker` for Telegram sticker packs |
 | `TELEGRAM_API_BASE` | `https://api.telegram.org` | Override for a proxy or a local Bot API server |
 | `RUST_LOG` | unset | Tracing filter, e.g. `megumi=info` to see command outcomes |
+| `NEWS_DB` | `news.json` | Where group news subscriptions are stored |
+| `NEWS_HOUR` | `7` | Local hour the morning digest is sent at |
 
 ## Development
 

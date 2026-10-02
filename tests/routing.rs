@@ -1,5 +1,8 @@
 use megumi::parse_command_text;
-use megumi_whatsapp::{commands, framework};
+use megumi_whatsapp::commands;
+
+mod common;
+use common::framework;
 
 #[test]
 fn kick_is_routed_to_the_registered_command() {
@@ -37,6 +40,26 @@ fn the_media_commands_declare_the_reaction_they_work_under() {
 }
 
 #[test]
+fn download_and_its_aliases_are_routed_to_the_registered_command() {
+    for trigger in ["!download", "!dl", "!ytdl"] {
+        let (name, args) = parse_command_text(trigger, "!").unwrap();
+        assert_eq!(args, "");
+        assert!(
+            framework().command_help(name).is_some(),
+            "`{name}` is not registered"
+        );
+    }
+
+    let (name, args) = parse_command_text("!dl https://youtu.be/abc", "!").unwrap();
+    assert_eq!(name, "dl");
+    assert_eq!(args, "https://youtu.be/abc");
+    assert_eq!(
+        commands::download().into_command().react.as_deref(),
+        Some("⌛")
+    );
+}
+
+#[test]
 fn kick_is_an_admin_command_restricted_to_groups() {
     let help = framework().command_help("group kick").unwrap();
     assert!(help.contains("!group kick"), "{help}");
@@ -62,7 +85,7 @@ fn group_and_its_subcommands_are_registered() {
     let parent = framework.command_help("group").unwrap();
     assert!(parent.contains("groups only"), "{parent}");
     assert!(parent.contains("Admin"), "{parent}");
-    for subcommand in ["info", "subject", "promote", "kick", "requests"] {
+    for subcommand in ["info", "subject", "promote", "kick", "requests", "news"] {
         assert!(
             parent.contains(subcommand),
             "`{subcommand}` missing from group help: {parent}"

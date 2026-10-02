@@ -28,10 +28,16 @@ pub fn digest_hour() -> u32 {
 /// so the answer is `None`. At and after the hour it is today's date, which is
 /// what the delivery record is keyed by.
 pub fn morning_of(now: DateTime<Local>) -> Option<NaiveDate> {
+    morning_of_at(now, digest_hour())
+}
+
+/// [`morning_of`] against an explicit hour, so the boundary can be tested without
+/// touching `NEWS_HOUR` in the process environment.
+fn morning_of_at(now: DateTime<Local>, hour: u32) -> Option<NaiveDate> {
     // The hour comes out of the formatted time: the `clock` feature that adds
     // `NaiveTime::hour` is not in the resolved chrono, and formatting needs nothing.
-    let hour: u32 = now.format("%H").to_string().parse().unwrap_or(0);
-    (hour >= digest_hour()).then(|| now.date_naive())
+    let current: u32 = now.format("%H").to_string().parse().unwrap_or(0);
+    (current >= hour).then(|| now.date_naive())
 }
 
 #[cfg(test)]
@@ -49,18 +55,18 @@ mod tests {
 
     #[test]
     fn the_morning_starts_at_the_configured_hour() {
-        // The tests read the default hour, so pin the environment out of the way.
-        // SAFETY: the test binary is single-threaded here.
-        unsafe { std::env::remove_var("NEWS_HOUR") };
-
-        assert_eq!(morning_of(at(6, 59)), None, "one minute early is too soon");
         assert_eq!(
-            morning_of(at(DEFAULT_HOUR, 0)).map(|day| day.to_string()),
+            morning_of_at(at(6, 59), DEFAULT_HOUR),
+            None,
+            "one minute early is too soon"
+        );
+        assert_eq!(
+            morning_of_at(at(DEFAULT_HOUR, 0), DEFAULT_HOUR).map(|day| day.to_string()),
             Some("2026-10-05".to_string()),
             "the hour itself counts"
         );
         assert!(
-            morning_of(at(23, 30)).is_some(),
+            morning_of_at(at(23, 30), DEFAULT_HOUR).is_some(),
             "the rest of the day counts"
         );
     }

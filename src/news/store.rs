@@ -18,7 +18,7 @@ pub struct NewsStore {
     state: Mutex<State>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct State {
     /// Chat id → nothing. Presence is the whole subscription.
     #[serde(default)]
@@ -56,15 +56,21 @@ impl NewsStore {
     }
 
     /// Subscribes or unsubscribes `chat`. Returns whether that changed anything.
+    ///
+    /// The change is made on a copy and written before the in-memory state is
+    /// replaced, so a write that fails leaves the store as it was and the caller
+    /// can retry.
     pub fn set_enabled(&self, chat: &str, enabled: bool) -> Result<bool, String> {
         let mut state = self.state()?;
+        let mut updated = state.clone();
         let changed = if enabled {
-            state.subscriptions.insert(chat.to_string(), ()).is_none()
+            updated.subscriptions.insert(chat.to_string(), ()).is_none()
         } else {
-            state.subscriptions.remove(chat).is_some()
+            updated.subscriptions.remove(chat).is_some()
         };
         if changed {
-            self.write(&state)?;
+            self.write(&updated)?;
+            *state = updated;
         }
         Ok(changed)
     }
@@ -85,13 +91,18 @@ impl NewsStore {
     }
 
     /// Records that `day`'s digest reached `chat`, so a restart will not resend it.
+    ///
+    /// As with [`set_enabled`](Self::set_enabled), the record is written before
+    /// the in-memory state is replaced, so a failed write can be retried.
     pub fn mark_delivered(&self, chat: &str, day: NaiveDate) -> Result<(), String> {
         let mut state = self.state()?;
-        let days = state.deliveries.entry(chat.to_string()).or_default();
+        let mut updated = state.clone();
         let day = day.to_string();
+        let days = updated.deliveries.entry(chat.to_string()).or_default();
         if !days.contains(&day) {
             days.push(day);
-            self.write(&state)?;
+            self.write(&updated)?;
+            *state = updated;
         }
         Ok(())
     }

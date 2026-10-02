@@ -27,8 +27,9 @@ const TICK: Duration = Duration::from_secs(60);
 
 /// Posts the morning digest to every group that asked for it.
 ///
-/// One loop per connection: `main` starts it when WhatsApp connects and aborts it
-/// on shutdown. Each tick checks whether a new morning has begun; a morning's
+/// One loop per connection: `main` starts it when WhatsApp connects, stopping
+/// the previous connection's loop first so only one ever runs. Each tick checks
+/// whether a new morning has begun; a morning's
 /// digest is fetched once and sent to each subscribed group that has not already
 /// had it. A group is marked done only after its message goes out, so a failure
 /// is retried on a later tick and, since the record is on disk, a digest that

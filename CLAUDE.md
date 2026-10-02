@@ -27,9 +27,10 @@ These override taste. When two rules pull in different directions, the earlier o
    you are in. This repo writes full prose doc comments, not terse ones.
 5. **Change only what the task needs.** No drive-by refactors, renames, or reformatting of untouched
    code. Leave a file strictly better than you found it, but only where you were already working.
-6. **Verify, don't assume.** A change to a command is done when `cargo test --workspace` and
-   `cargo clippy --workspace --all-targets` pass. Say so when they do, and show the failure when they
-   don't.
+6. **Verify, don't assume.** A change to a command is done when `cargo test --workspace`,
+   `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo +nightly fmt --all --check`
+   pass — clippy and fmt are the two gates CI enforces. Say so when they do, and show the failure
+   when they don't.
 
 ## Commands
 

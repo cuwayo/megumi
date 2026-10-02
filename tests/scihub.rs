@@ -1,5 +1,7 @@
 use megumi::parse_command_text;
-use megumi_whatsapp::framework;
+
+mod common;
+use common::framework;
 
 #[test]
 fn scihub_and_its_aliases_are_registered() {

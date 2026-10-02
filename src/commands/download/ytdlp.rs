@@ -188,18 +188,18 @@ async fn fetch(url: &str, directory: &Path) -> Result<Video, String> {
         return Err("yt-dlp saved the video outside its download directory.".to_string());
     }
 
+    // A phone plays H.264 with AAC in an MP4 and nothing else, so a download in
+    // another codec is re-encoded first. The bytes and the preview are both taken
+    // from the file that actually goes out.
+    let path = transcode(&path).await?;
+    let thumbnail = preview(&path, info.thumbnail.as_deref()).await;
+
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|error| format!("Could not read the downloaded video: {error}"))?;
     if bytes.is_empty() {
         return Err("yt-dlp saved an empty file.".to_string());
     }
-
-    // A phone plays H.264 with AAC in an MP4 and nothing else, so a download in
-    // another codec is re-encoded before it is read back. The preview is taken
-    // afterwards, from the file that is actually sent.
-    let path = transcode(&path).await?;
-    let thumbnail = preview(&path, info.thumbnail.as_deref()).await;
 
     // The container actually sent, which a transcode changes from whatever the
     // site served to mp4.

@@ -1,5 +1,8 @@
 use megumi::parse_command_text;
-use megumi_whatsapp::{commands, framework};
+use megumi_whatsapp::commands;
+
+mod common;
+use common::framework;
 
 #[test]
 fn kick_is_routed_to_the_registered_command() {

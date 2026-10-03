@@ -4,6 +4,7 @@ pub mod echo;
 pub mod group;
 pub mod help;
 pub mod ping;
+pub mod price;
 pub mod scihub;
 pub mod shazam;
 pub mod sticker;
@@ -15,6 +16,7 @@ pub use echo::echo;
 pub use group::group;
 pub use help::help;
 pub use ping::ping;
+pub use price::price;
 pub use scihub::scihub;
 pub use shazam::shazam;
 pub use sticker::sticker;
@@ -47,6 +49,7 @@ pub mod utility {}
         crate::commands::sticker,
         crate::commands::shazam,
         crate::commands::download,
+        crate::commands::price,
     )
 )]
 pub mod media {}

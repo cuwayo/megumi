@@ -109,6 +109,39 @@ fn console_is_reachable_in_any_chat_and_hidden_from_help() {
 }
 
 #[test]
+fn price_and_its_alias_are_routed_to_the_registered_command() {
+    for trigger in ["!price", "!px"] {
+        let (name, args) = parse_command_text(trigger, "!").unwrap();
+        assert_eq!(args, "");
+        assert!(
+            framework().command_help(name).is_some(),
+            "`{name}` is not registered"
+        );
+    }
+
+    let (name, args) = parse_command_text("!px GC=F", "!").unwrap();
+    assert_eq!(name, "px");
+    assert_eq!(args, "GC=F");
+    assert_eq!(
+        commands::price().into_command().react.as_deref(),
+        Some("📈")
+    );
+}
+
+#[test]
+fn group_price_is_a_subcommand_of_group() {
+    let parent = framework().command_help("group").unwrap();
+    assert!(
+        parent.contains("price"),
+        "`price` missing from group help: {parent}"
+    );
+    assert!(
+        framework().command_help("group price").is_some(),
+        "`group price` is not registered"
+    );
+}
+
+#[test]
 fn uptime_is_registered() {
     let (name, args) = parse_command_text("!uptime", "!").unwrap();
     assert_eq!(name, "uptime");

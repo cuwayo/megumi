@@ -138,26 +138,31 @@ groups commands under. Each group's `context = crate::Context` is how the macro 
 
 - `utility` — `help`, `ping`, `echo`, `uptime`, `scihub`. `!scihub` resolves a DOI (bare, `doi.org`, or
   Sci-Hub URL) or a title against the Crossref API and replies with a Sci-Hub link.
-- `media` — `sticker`, `shazam`, `download`. The first two take their input from a quoted message, the
+- `media` — `sticker`, `shazam`, `download`, `price`. The first two take their input from a quoted message, the
   command's own caption, or a URL, and ignore spare words in a caption. `!download <url>` fetches the video
   at an http(s) address with `yt-dlp` (`src/commands/download/`) and sends it back. `yt-dlp` is told to
   refuse anything over 100 MB (`MAX_DOWNLOAD`); what comes back is sent as a playable video up to 64 MB and
   as a document past that. `!shazam` transcodes to 16 kHz mono PCM with `ffmpeg`,
   fingerprints it locally (`src/commands/shazam/fingerprint.rs`), and recognises it against Shazam.
   `!sticker <t.me/addstickers/...>` converts a Telegram sticker pack into WhatsApp packs of at most 60
-  stickers; that path is the only one needing `TELEGRAM_BOT_TOKEN`.
+  stickers; that path is the only one needing `TELEGRAM_BOT_TOKEN`. `!price [symbol]` charts any symbol
+  Yahoo Finance knows (`src/price/`) — the same chart the weekly update posts — and draws it with
+  `plotters` (`src/price/chart.rs`) over the bundled Noto Sans Mono in `assets/`. `plotters` is built
+  without its `ttf` feature (which would link the system freetype/fontconfig) and uses the pure-Rust
+  `ab_glyph` backend, so the font is embedded and the PNG is still encoded by `image`.
 - `admin` — `group`, whose subcommands rename the group, change its settings, and manage members. The parent
   declares `guild_only`, `permission = GroupAdmin`, and `subcommand_required`, so its body never runs and
   every child inherits the gates. Settings that take a fixed set of words (`announce`, `ephemeral`,
-  `addmode`, …) parse them with `ChoiceParameter` enums. `!group news` is the one setting the bot keeps
-  itself: it subscribes the group to a morning RSS digest (`src/news/`), stored in `news.json` and posted by a
-  task spawned when the client connects.
+  `addmode`, …) parse them with `ChoiceParameter` enums. Two settings the bot keeps itself: `!group news`
+  subscribes the group to a morning RSS digest (`src/news/`), and `!group price` to a weekly price chart
+  (`src/price/`). Both are stored in their own JSON file (`news.json`, `price.json`) and posted by a task
+  spawned when the client connects.
 - `owner` — `console` (alias `sh`), `permission = Owner` and `hide_in_help`. It runs the rest of the message
   under `sh -c` with a 10 s timeout and replies with the tail of the output.
 
 `Data` (in `src/data.rs`) holds the process start time, pinned in `framework()` so `!uptime` measures the
-whole run, and the news subscription store. `main` builds the framework before connecting, so that instant
-precedes the first command.
+whole run, and the news and price subscription stores. `main` builds the framework before connecting, so that
+instant precedes the first command.
 
 ## Adding a command
 

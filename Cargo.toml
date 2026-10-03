@@ -20,6 +20,7 @@ rand = "0.10.3"
 crc32fast = "1.5.2"
 byteorder = "1.5.0"
 image = "0.25.10"
+plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "ab_glyph", "line_series", "area_series"] }
 dotenvy = "0.15"
 chrono = "0.4.45"
 

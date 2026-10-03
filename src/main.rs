@@ -22,11 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteStore::new("whatsapp.db").await?;
     let framework = framework();
     let data = framework.user_data().clone();
-    // The digest loop a connection started, so a reconnect can stop it before
+    // The loops a connection started, so a reconnect can stop each before
     // starting its replacement. `Connected` fires again on every reconnect, and
-    // the loop runs forever, so without this each reconnect would leave another
+    // the loops run forever, so without this each reconnect would leave another
     // loop running beside the new one.
     let news_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let price_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
 
     let bot = Bot::builder()
@@ -34,18 +36,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .on_connected(move |client| {
             let data = data.clone();
             let news_task = news_task.clone();
+            let price_task = price_task.clone();
             async move {
                 info!("Connected with WhatsApp");
-                // Stop the previous connection's loop and wait for it to be gone
-                // before starting the new one, so only one ever runs. A morning
-                // already delivered is recorded on disk, so restarting the loop
-                // does not resend it.
-                let mut task = news_task.lock().await;
+                // Stop the previous connection's loops and wait for them to be
+                // gone before starting the new ones, so only one of each ever
+                // runs. A digest or a chart already delivered is recorded on
+                // disk, so restarting a loop does not resend it.
+                {
+                    let mut task = news_task.lock().await;
+                    if let Some(previous) = task.take() {
+                        previous.abort();
+                        let _ = previous.await;
+                    }
+                    *task = Some(tokio::spawn(megumi_whatsapp::news::run(
+                        client.clone(),
+                        data.clone(),
+                    )));
+                }
+                let mut task = price_task.lock().await;
                 if let Some(previous) = task.take() {
                     previous.abort();
                     let _ = previous.await;
                 }
-                *task = Some(tokio::spawn(megumi_whatsapp::news::run(client, data)));
+                *task = Some(tokio::spawn(megumi_whatsapp::price::run(client, data)));
             }
         })
         .on_qr_code(|code, timeout| async move {

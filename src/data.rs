@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::news::store::NewsStore;
+use crate::price::store::PriceStore;
 
 /// The state every command shares, built once in [`crate::framework`].
 ///
@@ -16,4 +17,7 @@ pub struct Data {
     /// Which groups receive the morning digest. Shared with the scheduler, which
     /// holds the same `Data` the commands do.
     pub news: Arc<NewsStore>,
+    /// Which groups receive the weekly price update, and which symbols they watch.
+    /// Shared with the price scheduler the same way `news` is.
+    pub price: Arc<PriceStore>,
 }

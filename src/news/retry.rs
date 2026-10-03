@@ -1,11 +1,11 @@
-//! How long to wait before fetching the digest again after a failure.
+//! How long to wait before fetching a digest again after a failure.
 //!
-//! The scheduler wakes every minute, and a morning that cannot be fetched stays
-//! pending for the rest of the day, so without a backoff an unreachable feed
-//! would be asked once a minute until midnight. The wait doubles with each
-//! consecutive failure and is capped, and a fetch that works — or a new
-//! morning — starts the count over. The decision is a pure function of the
-//! clock handed in, so it can be tested without waiting.
+//! The schedulers wake every minute, and a period that cannot be fetched stays
+//! pending for the rest of it, so without a backoff an unreachable feed would be
+//! asked once a minute until midnight. The wait doubles with each consecutive
+//! failure and is capped, and a fetch that works — or a new period — starts the
+//! count over. The decision is a pure function of the clock handed in, so it can
+//! be tested without waiting.
 
 use std::time::{Duration, Instant};
 
@@ -14,13 +14,13 @@ use chrono::NaiveDate;
 /// The wait after the first failed fetch. Each further failure doubles it.
 const RETRY_BASE: Duration = Duration::from_secs(5 * 60);
 
-/// The longest wait between attempts, so a day-long outage still retries.
+/// The longest wait between attempts, so a long outage still retries.
 const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
-/// The record of failed digest fetches for one morning.
+/// The record of failed digest fetches for one period.
 #[derive(Default)]
 pub struct Backoff {
-    /// The morning the failures below belong to. A different day starts fresh.
+    /// The period the failures below belong to. A different key starts fresh.
     day: Option<NaiveDate>,
     /// How many fetches have failed in a row for `day`.
     failures: u32,
@@ -31,7 +31,7 @@ pub struct Backoff {
 impl Backoff {
     /// Whether a fetch for `day` may be attempted at `now`.
     pub fn ready(&self, day: NaiveDate, now: Instant) -> bool {
-        // A new morning, or a run with no failures behind it, always fetches.
+        // A new period, or a run with no failures behind it, always fetches.
         self.day != Some(day) || self.next_attempt.is_none_or(|at| now >= at)
     }
 
@@ -111,14 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn a_new_morning_starts_over() {
+    fn a_new_period_starts_over() {
         let first = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
         let second = NaiveDate::from_ymd_opt(2026, 10, 6).unwrap();
         let base = Instant::now();
         let mut backoff = Backoff::default();
 
         backoff.record_failure(first, base);
-        assert!(backoff.ready(second, base), "a new day is not held back");
+        assert!(backoff.ready(second, base), "a new period is not held back");
 
         // The failure count is forgotten too, so the wait is the base again.
         backoff.record_failure(second, base);

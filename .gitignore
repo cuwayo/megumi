@@ -7,6 +7,9 @@ whatsapp.db*
 # Which groups subscribed to the morning digest, and which mornings went out.
 news.json*
 
+# Which groups subscribed to the daily price update, and which days went out.
+price.json*
+
 # Secrets. .env.example is the committed template.
 .env
 .env.*

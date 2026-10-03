@@ -1,6 +1,6 @@
 use megumi::ChoiceParameter;
 use megumi_whatsapp::commands::group::{
-    Audience, Ephemeral, Toggle, render_info, render_info_with,
+    Audience, Ephemeral, PriceAction, Toggle, render_info, render_info_with,
 };
 use whatsapp_rust::{GroupEphemeralSettings, GroupMetadata, MemberAddMode};
 
@@ -25,6 +25,46 @@ fn ephemeral_maps_to_whatsapp_durations() {
     assert_eq!(Ephemeral::from_name("week"), Some(Ephemeral::Week));
     assert_eq!(Ephemeral::from_name("90d"), Some(Ephemeral::Quarter));
     assert_eq!(Ephemeral::from_name("2d"), None);
+}
+
+#[test]
+fn price_actions_accept_the_words_people_type() {
+    for word in ["on", "ON", "enable"] {
+        assert_eq!(
+            PriceAction::from_name(word),
+            Some(PriceAction::On),
+            "{word}"
+        );
+    }
+    for word in ["off", "disable"] {
+        assert_eq!(
+            PriceAction::from_name(word),
+            Some(PriceAction::Off),
+            "{word}"
+        );
+    }
+    for word in ["add", "watch"] {
+        assert_eq!(
+            PriceAction::from_name(word),
+            Some(PriceAction::Add),
+            "{word}"
+        );
+    }
+    for word in ["remove", "rm", "unwatch"] {
+        assert_eq!(
+            PriceAction::from_name(word),
+            Some(PriceAction::Remove),
+            "{word}"
+        );
+    }
+    for word in ["list", "show"] {
+        assert_eq!(
+            PriceAction::from_name(word),
+            Some(PriceAction::List),
+            "{word}"
+        );
+    }
+    assert_eq!(PriceAction::from_name("maybe"), None);
 }
 
 #[test]

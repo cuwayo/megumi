@@ -31,6 +31,7 @@ use whatsapp_rust::{
         linkmode,
         approval,
         news,
+        price,
         link,
         resetlink,
         promote,
@@ -240,6 +241,100 @@ async fn news(ctx: Context, setting: Toggle) -> Result<(), Error> {
         (false, false) => "Morning news is already off for this group.",
     };
     ctx.say(reply).await
+}
+
+/// Sets whether this group gets a weekly price update, and which symbols it charts.
+#[command(name = "price")]
+async fn price(ctx: Context, action: PriceAction, symbol: Option<String>) -> Result<(), Error> {
+    let chat = chat(&ctx).to_string();
+    let store = &ctx.data().price;
+
+    let reply = match action {
+        PriceAction::On => {
+            let changed = store
+                .set_enabled(&chat, true)
+                .map_err(|error| format!("Failed to save the price setting: {error}"))?;
+            let symbols = store.symbols(&chat).unwrap_or_default();
+            if changed {
+                format!(
+                    "Weekly price update is on. This group will get {} each week.",
+                    list_symbols(&symbols)
+                )
+            } else {
+                format!(
+                    "The weekly price update is already on for this group ({}).",
+                    list_symbols(&symbols)
+                )
+            }
+        }
+        PriceAction::Off => {
+            let changed = store
+                .set_enabled(&chat, false)
+                .map_err(|error| format!("Failed to save the price setting: {error}"))?;
+            if changed {
+                "Weekly price update is off. This group will no longer get a chart.".to_string()
+            } else {
+                "The weekly price update is already off for this group.".to_string()
+            }
+        }
+        PriceAction::Add => {
+            let Some(symbol) = symbol else {
+                return ctx.say("Usage: `!group price add <symbol>`").await;
+            };
+            store
+                .add_symbol(&chat, &symbol)
+                .map_err(|error| format!("Failed to save the price symbol: {error}"))?;
+            format!(
+                "Now charting `{}`. This group watches {}.",
+                symbol.to_uppercase(),
+                list_symbols(&store.symbols(&chat).unwrap_or_default())
+            )
+        }
+        PriceAction::Remove => {
+            let Some(symbol) = symbol else {
+                return ctx.say("Usage: `!group price remove <symbol>`").await;
+            };
+            let removed = store
+                .remove_symbol(&chat, &symbol)
+                .map_err(|error| format!("Failed to save the price symbol: {error}"))?;
+            if removed {
+                let symbols = store.symbols(&chat).unwrap_or_default();
+                if symbols.is_empty() {
+                    "Removed the last symbol, so the weekly update is off.".to_string()
+                } else {
+                    format!("Stopped charting `{}`.", symbol.to_uppercase())
+                }
+            } else {
+                format!("`{}` was not being charted.", symbol.to_uppercase())
+            }
+        }
+        PriceAction::List => {
+            let symbols = store.symbols(&chat).unwrap_or_default();
+            if symbols.is_empty() {
+                "The weekly price update is off. Turn it on with `!group price on`.".to_string()
+            } else {
+                format!(
+                    "Weekly price update: on.\nSymbols: {}\nUse `!price <symbol>` for a one-off chart.",
+                    list_symbols(&symbols)
+                )
+            }
+        }
+    };
+    ctx.say(reply).await
+}
+
+/// "`CL=F`", "`CL=F` and `GC=F`", or "`A`, `B`, and `C`".
+fn list_symbols(symbols: &[String]) -> String {
+    let quoted: Vec<String> = symbols.iter().map(|symbol| format!("`{symbol}`")).collect();
+    match quoted.as_slice() {
+        [] => "no symbols".to_string(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        _ => {
+            let (last, rest) = quoted.split_last().expect("non-empty");
+            format!("{}, and {last}", rest.join(", "))
+        }
+    }
 }
 
 /// Shows the group's invite link.
@@ -490,6 +585,27 @@ impl Toggle {
     fn enabled(self) -> bool {
         matches!(self, Self::On)
     }
+}
+
+/// What `!group price` does to this group's weekly update.
+#[derive(ChoiceParameter, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PriceAction {
+    #[name = "on"]
+    #[name = "enable"]
+    On,
+    #[name = "off"]
+    #[name = "disable"]
+    Off,
+    #[name = "add"]
+    #[name = "watch"]
+    Add,
+    #[name = "remove"]
+    #[name = "rm"]
+    #[name = "unwatch"]
+    Remove,
+    #[name = "list"]
+    #[name = "show"]
+    List,
 }
 
 /// The disappearing-message durations WhatsApp offers.

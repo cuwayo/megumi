@@ -17,6 +17,8 @@ group administration, and it ships with a reusable command framework modelled on
   convert a whole Telegram sticker pack into WhatsApp packs.
 - **Song recognition** — identify a song from an audio or video clip.
 - **Paper lookup** — resolve a DOI or title to its metadata and a Sci-Hub link.
+- **Price charts** — chart any symbol's last 24 hours on demand, or post a weekly
+  chart to a group.
 - **Group administration** — rename the group, manage members, and change group
   settings, restricted to group admins.
 - **Help that writes itself** — `!help` lists every command, grouped, from the
@@ -72,6 +74,7 @@ shows a command's own usage and description.
 | `!sticker [url]` | `stiker` | Converts an image, video, GIF, or URL into a sticker |
 | `!shazam [url]` | `sz` | Recognises a song from an audio or video clip |
 | `!download <url>` | `dl`, `ytdl` | Downloads a video and sends it back |
+| `!price [symbol]` | `px` | Charts a symbol's last 24 hours |
 
 For `!sticker` and `!shazam`, reply to a message that contains the media, send
 the command as the media's caption, or pass a public URL. Extra words in a
@@ -86,6 +89,13 @@ the video the address points at.
 `!sticker <t.me/addstickers/...>` converts a Telegram sticker pack into one or
 more WhatsApp packs of at most 60 stickers each. An optional second argument
 names the pack. This path needs `TELEGRAM_BOT_TOKEN` in `.env`.
+
+`!price [symbol]` charts a symbol's last 24 hours as an image — its name, the
+last price and its 24-hour change, the day's open/high/low/close, and a filled
+intraday line. Any symbol Yahoo Finance knows works: `!price CL=F` (WTI crude,
+the default), `!price GC=F` (gold), `!price BTC-USD`, `!price AAPL`, or a pair
+like `!price EURUSD=X`. With no symbol, the group's first watched one is charted.
+The data comes from Yahoo Finance's public chart endpoint and needs no API key.
 
 ### Group administration
 
@@ -104,6 +114,7 @@ admins. A bare `!group` tells you it needs a subcommand.
 | `!group linkmode <all\|admins>` | Sets who can share the invite link |
 | `!group approval <on\|off>` | Sets whether an admin must approve new members |
 | `!group news <on\|off>` | Sets whether the group gets a news digest each morning |
+| `!group price <on\|off\|add\|remove\|list> [symbol]` | Sets whether the group gets a weekly price chart, and which symbols |
 | `!group link` | Shows the invite link |
 | `!group resetlink` | Revokes the invite link and shows the new one |
 | `!group add @member` | Adds members (tag them, reply to one, or type a number) |
@@ -119,6 +130,13 @@ each morning at 07:00 in the machine's local time. The headlines come from RSS:
 BBC News, BBC World, and The Guardian's world desk. `!group news off` stops
 them. The subscription is remembered across restarts, and a morning that already
 went out is not sent again.
+
+`!group price on` subscribes the group to a weekly price chart, posted on Monday
+at 09:00 in the machine's local time; the same chart `!price` renders on demand.
+The group starts watching `CL=F` (WTI crude); `!group price add GC=F` adds another
+symbol and `!group price remove GC=F` drops one, and `!group price list` shows what
+the group watches. Subscriptions and the record of which weeks have gone out are
+remembered across restarts, so a chart is never posted twice.
 
 ### Owner
 
@@ -140,6 +158,9 @@ optional; without the file the bot runs with sticker-pack conversion disabled.
 | `RUST_LOG` | unset | Tracing filter, e.g. `megumi=info` to see command outcomes |
 | `NEWS_DB` | `news.json` | Where group news subscriptions are stored |
 | `NEWS_HOUR` | `7` | Local hour the morning digest is sent at |
+| `PRICE_DB` | `price.json` | Where group price subscriptions are stored |
+| `PRICE_HOUR` | `9` | Local hour the weekly price update is sent at |
+| `PRICE_WEEKDAY` | `monday` | Local weekday the weekly price update is sent on |
 
 ## Development
 

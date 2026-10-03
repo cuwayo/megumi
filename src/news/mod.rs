@@ -6,7 +6,8 @@
 //! both survive a restart.
 
 mod feed;
-mod retry;
+// The price update shares this backoff rather than growing a second copy.
+pub(crate) mod retry;
 mod schedule;
 pub mod store;
 

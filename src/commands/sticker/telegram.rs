@@ -7,8 +7,9 @@ use std::time::Duration;
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use whatsapp_rust::Client;
-use whatsapp_rust::anyhow::{Result, anyhow, bail};
+use whatsapp_rust::anyhow::{Error, Result, anyhow, bail};
 use whatsapp_rust::download::MediaType;
 use whatsapp_rust::prelude::wa;
 use whatsapp_rust::sticker_pack::{
@@ -296,15 +297,17 @@ async fn download_file(
 
 /// Prepares a 512x512 WebP sticker from raw media data.
 ///
-/// Telegram serves a static sticker as a conforming WebP already, which
-/// [`transcode::to_sticker`] answers as it stands; anything else, a `.webm`
-/// video sticker above all, is fitted by ffmpeg.
+/// Telegram serves static stickers as conforming WebP files, Lottie stickers as
+/// gzipped `.tgs` files, and video stickers as `.webm`. A gzip signature takes
+/// the Lottie renderer regardless of Telegram metadata, which keeps mixed packs
+/// and incorrectly marked media from being sent through ffmpeg unreadable.
 ///
-/// Telegram's `is_video` flag names a video sticker, but the bytes are asked as
-/// well so a set whose metadata is wrong — a mixed set, or a video Telegram did
-/// not mark — still gets the animated allowance its media needs rather than the
-/// still one it cannot fit.
+/// Telegram's video flag is retained as a fallback for media whose container
+/// does not identify its animation by itself.
 async fn prepare_sticker_data(data: &[u8], is_video: bool) -> Result<Vec<u8>> {
+    if data.starts_with(&[0x1f, 0x8b]) {
+        return super::lottie::to_sticker(data).await;
+    }
     let animated = is_video || transcode::is_animated(data).await;
     transcode::to_sticker(data, animated)
         .await
@@ -369,13 +372,6 @@ pub async fn convert_telegram_pack(
 
     let set = fetch_sticker_set(http, &base, &token, pack_slug).await?;
 
-    if set.is_animated {
-        bail!(
-            "Telegram animated stickers (.tgs / Lottie) are not supported.\n\
-             Only static image packs and video (.webm) packs are supported."
-        );
-    }
-
     if set.stickers.is_empty() {
         bail!("Telegram sticker set `{}` contains no stickers.", set.name);
     }
@@ -389,99 +385,125 @@ pub async fn convert_telegram_pack(
     let mut result_messages = Vec::new();
     let semaphore = Arc::new(Semaphore::new(6));
 
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let pack_name = if total_packs == 1 || i == 0 {
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let stickers = convert_chunk(http, &base, &token, chunk, semaphore.clone()).await?;
+
+        let pack_name = if total_packs == 1 || index == 0 {
             base_name.clone()
         } else {
-            format!("{base_name} {}", i + 1)
+            format!("{base_name} {}", index + 1)
         };
-
         let pack_id = format!(
             "{}_{}_{}",
             sanitize_pack_id(&set.name),
-            i + 1,
+            index + 1,
             uuid::Uuid::new_v4().simple()
         );
-
-        // Download and transcode stickers in this chunk concurrently with bounded concurrency
-        let mut sticker_tasks = Vec::new();
-        for s in chunk {
-            let s = s.clone();
-            let base = base.clone();
-            let token = token.clone();
-            let sem = semaphore.clone();
-
-            sticker_tasks.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.map_err(|error| anyhow!("{error}"))?;
-                let file_path = get_file_path(http, &base, &token, &s.file_id).await?;
-                let raw_data = download_file(http, &base, &token, &file_path).await?;
-                let processed = prepare_sticker_data(&raw_data, s.is_video).await?;
-                Result::<(Vec<u8>, Option<String>)>::Ok((processed, s.emoji))
-            }));
-        }
-
-        let mut chunk_stickers = Vec::new();
-        for task in sticker_tasks {
-            let res = task
-                .await
-                .map_err(|error| anyhow!("Sticker download task failed: {error}"))??;
-            chunk_stickers.push(res);
-        }
-
-        if chunk_stickers.is_empty() {
-            continue;
-        }
-
-        // Prepare the cover and thumbnail JPEG from the first sticker
-        let cover_webp = &chunk_stickers[0].0;
-        let thumb_jpeg = create_jpeg_thumbnail(cover_webp)?;
-
-        // Prepare StickerInputs for create_sticker_pack_zip
-        let sticker_inputs: Vec<StickerInput> = chunk_stickers
-            .iter()
-            .map(|(data, emoji)| {
-                let mut input = StickerInput::new(data);
-                if let Some(emoji) = emoji {
-                    input = input.with_emojis(vec![emoji.clone()]);
-                }
-                input
-            })
-            .collect();
-
-        // Build the store-only ZIP archive
-        let zip_result = create_sticker_pack_zip(&pack_id, &sticker_inputs, cover_webp)
-            .map_err(|error| anyhow!("Failed to create sticker pack ZIP: {error}"))?;
-
-        // Generate shared 32-byte media key for BOTH the zip and thumbnail
-        let media_key: [u8; 32] = rand::random();
-
-        // Upload zip and thumbnail concurrently
-        let (zip_upload, thumb_upload) = tokio::try_join!(
-            client.upload(
-                zip_result.zip_bytes.clone(),
-                MediaType::StickerPack,
-                UploadOptions::new().with_media_key(media_key),
-            ),
-            client.upload(
-                thumb_jpeg,
-                MediaType::StickerPackThumbnail,
-                UploadOptions::new().with_media_key(media_key),
-            ),
-        )
-        .map_err(|error| anyhow!("Failed to upload sticker pack media: {error}"))?;
-
-        let metadata = StickerPackMetadata::new(pack_id, pack_name.clone(), "Megumi".into());
-
-        let msg = build_sticker_pack_message(
-            &zip_result,
-            &zip_upload.into(),
-            &thumb_upload.into(),
-            metadata,
-        )
-        .map_err(|error| anyhow!("Failed to build sticker pack message: {error}"))?;
-
+        let msg = build_pack_message(client, &pack_id, &pack_name, stickers).await?;
         result_messages.push(msg);
     }
 
     Ok(result_messages)
+}
+
+/// Downloads and converts one pack chunk's stickers concurrently, bounded by
+/// `semaphore`, and answers with them in the order Telegram listed them.
+async fn convert_chunk(
+    http: &'static reqwest::Client,
+    base: &str,
+    token: &str,
+    stickers: &[TgSticker],
+    semaphore: Arc<Semaphore>,
+) -> Result<Vec<(Vec<u8>, Option<String>)>> {
+    let count = stickers.len();
+    let mut tasks = JoinSet::new();
+    for (index, sticker) in stickers.iter().enumerate() {
+        let base = base.to_string();
+        let token = token.to_string();
+        let sticker = sticker.clone();
+        let semaphore = semaphore.clone();
+        tasks.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|error| anyhow!("{error}"))?;
+            let path = get_file_path(http, &base, &token, &sticker.file_id).await?;
+            let data = download_file(http, &base, &token, &path).await?;
+            let converted = prepare_sticker_data(&data, sticker.is_video).await?;
+            Ok::<_, Error>((index, (converted, sticker.emoji)))
+        });
+    }
+
+    // Results arrive as each sticker finishes, so they are placed back at their
+    // own index; a failure drops the set, which aborts the stickers still in
+    // flight.
+    let mut ordered: Vec<Option<(Vec<u8>, Option<String>)>> = (0..count).map(|_| None).collect();
+    while let Some(result) = tasks.join_next().await {
+        let (index, value) = match result {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(anyhow!("Sticker download task failed: {error}")),
+        };
+        let Some(slot) = ordered.get_mut(index) else {
+            bail!("Sticker conversion task returned an invalid index.");
+        };
+        *slot = Some(value);
+    }
+
+    ordered
+        .into_iter()
+        .map(|sticker| sticker.ok_or_else(|| anyhow!("Sticker conversion task returned no result")))
+        .collect()
+}
+
+/// Builds and uploads one WhatsApp sticker pack from its converted stickers.
+async fn build_pack_message(
+    client: &Client,
+    pack_id: &str,
+    pack_name: &str,
+    chunk_stickers: Vec<(Vec<u8>, Option<String>)>,
+) -> Result<wa::Message> {
+    if chunk_stickers.is_empty() {
+        bail!("Sticker pack chunk is empty.");
+    }
+
+    let cover_webp = &chunk_stickers[0].0;
+    let thumb_jpeg = create_jpeg_thumbnail(cover_webp)?;
+    let sticker_inputs: Vec<StickerInput> = chunk_stickers
+        .iter()
+        .map(|(data, emoji)| {
+            let mut input = StickerInput::new(data);
+            if let Some(emoji) = emoji {
+                input = input.with_emojis(vec![emoji.clone()]);
+            }
+            input
+        })
+        .collect();
+
+    let zip_result = create_sticker_pack_zip(pack_id, &sticker_inputs, cover_webp)
+        .map_err(|error| anyhow!("Failed to create sticker pack ZIP: {error}"))?;
+    let media_key: [u8; 32] = rand::random();
+    let (zip_upload, thumb_upload) = tokio::try_join!(
+        client.upload(
+            zip_result.zip_bytes.clone(),
+            MediaType::StickerPack,
+            UploadOptions::new().with_media_key(media_key),
+        ),
+        client.upload(
+            thumb_jpeg,
+            MediaType::StickerPackThumbnail,
+            UploadOptions::new().with_media_key(media_key),
+        ),
+    )
+    .map_err(|error| anyhow!("Failed to upload sticker pack media: {error}"))?;
+
+    let metadata =
+        StickerPackMetadata::new(pack_id.to_string(), pack_name.to_string(), "Megumi".into());
+    build_sticker_pack_message(
+        &zip_result,
+        &zip_upload.into(),
+        &thumb_upload.into(),
+        metadata,
+    )
+    .map_err(|error| anyhow!("Failed to build sticker pack message: {error}"))
 }

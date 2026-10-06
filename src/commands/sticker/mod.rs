@@ -1,5 +1,6 @@
 //! `!sticker` turns media into a WhatsApp sticker, or converts a Telegram sticker pack.
 
+pub mod lottie;
 pub mod source;
 pub mod telegram;
 pub mod transcode;

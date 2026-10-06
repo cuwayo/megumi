@@ -30,13 +30,19 @@ const STILL_ATTEMPTS: &[(u8, Option<NonZeroU8>)] = &[(80, None), (55, None), (30
 /// Reducing the frame rate is far cheaper than a quality drop alone because
 /// fewer frames means fewer VP8 blocks to encode and less data in the output.
 /// Quality is stepped down only after exhausting the fps options at that tier.
+///
+/// A sticker that carries real transparency spends bytes on its alpha plane, so
+/// the ladder reaches low frame rates: a three-second Telegram video sticker
+/// whose alpha fits no other way still comes out animated, if choppier.
 const ANIMATED_ATTEMPTS: &[(u8, Option<NonZeroU8>)] = &[
     (80, None),
     (80, nzu8(20)),
     (70, nzu8(15)),
     (60, nzu8(12)),
     (55, nzu8(10)),
-    (30, nzu8(10)),
+    (40, nzu8(8)),
+    (30, nzu8(6)),
+    (25, nzu8(5)),
 ];
 
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -87,6 +93,30 @@ pub fn limit(animated: bool) -> usize {
     }
 }
 
+/// The decoder ffmpeg has to be told to use for media whose transparency is
+/// carried in a Matroska/WebM alpha plane.
+///
+/// ffmpeg's built-in VP8/VP9 decoders ignore that plane, so a video sticker
+/// decodes fully opaque and lands on a black background; the libvpx decoders
+/// read it. Only WebM is named here — other containers do not store alpha this
+/// way, and forcing a decoder on media that is not VP8/VP9 would fail.
+fn alpha_decoder(data: &[u8]) -> Option<&'static str> {
+    // The EBML header that opens every Matroska/WebM file.
+    if !data.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return None;
+    }
+    // CodecID appears in the Tracks element near the head of the file; a
+    // bounded scan keeps a large video from costing a full pass.
+    let head = &data[..data.len().min(64 * 1024)];
+    if head.windows(5).any(|window| window == b"V_VP9") {
+        Some("libvpx-vp9")
+    } else if head.windows(5).any(|window| window == b"V_VP8") {
+        Some("libvpx")
+    } else {
+        None
+    }
+}
+
 /// Runs one ffmpeg pass: fit to the sticker box, then encode it as WebP.
 ///
 /// The still and animated encoders are not interchangeable: the animated one
@@ -101,34 +131,47 @@ async fn encode(
     let filter = filter(fps_cap);
     let quality = quality.to_string();
     let codec = if animated { "libwebp_anim" } else { "libwebp" };
-
-    let mut arguments = vec![
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        "pipe:0",
+    let mut tail = vec![
+        "-i", "pipe:0",
         // Strip audio — stickers are video-only; without this some containers
         // cause ffmpeg to wait for an audio track that never ends.
-        "-an",
-        "-vf",
-        &filter,
-        "-c:v",
-        codec,
-        "-quality",
-        &quality,
+        "-an", "-vf", &filter, "-c:v", codec, "-quality", &quality,
     ];
     if animated {
         // vfr avoids duplicating frames that the fps filter already dropped,
         // keeping the WebP frame timestamps faithful to the intended cadence.
-        arguments.extend_from_slice(&["-fps_mode", "vfr"]);
-        arguments.extend_from_slice(&["-loop", "0"]);
+        tail.extend_from_slice(&["-fps_mode", "vfr", "-loop", "0"]);
     }
-    arguments.extend_from_slice(&["-f", "webp", "pipe:1"]);
+    tail.extend_from_slice(&["-f", "webp", "pipe:1"]);
 
+    // Telegram stores a video sticker's transparency in the container's alpha
+    // plane, which ffmpeg's built-in VP8/VP9 decoders ignore; the libvpx ones
+    // read it. If that decoder is not built in, fall back to the default rather
+    // than refusing the sticker — it just comes back opaque as it did before.
+    if let Some(decoder) = alpha_decoder(webp) {
+        let mut arguments = vec!["-hide_banner", "-loglevel", "error", "-c:v", decoder];
+        arguments.extend_from_slice(&tail);
+        match run_ffmpeg(&arguments, webp).await {
+            Ok(sticker) => return Ok(sticker),
+            // Only a build without libvpx warrants the second run; any other
+            // failure (a bad decode, a timeout) is the real answer and must not
+            // buy a retry that spends the whole timeout again.
+            Err(error) if error.contains("Unknown decoder") => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut arguments = vec!["-hide_banner", "-loglevel", "error"];
+    arguments.extend_from_slice(&tail);
+    run_ffmpeg(&arguments, webp).await
+}
+
+/// Spawns ffmpeg with `arguments`, pipes `input` through it, and answers with
+/// its stdout once it exits successfully.
+async fn run_ffmpeg(arguments: &[&str], input: &[u8]) -> Result<Vec<u8>, String> {
     let mut command = Command::new("ffmpeg");
     command
-        .args(&arguments)
+        .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -143,7 +186,7 @@ async fn encode(
         return Err("Could not capture ffmpeg's pipes.".to_string());
     };
 
-    let (sticker, errors) = tokio::time::timeout(TIMEOUT, transcode(stdin, stdout, stderr, webp))
+    let (sticker, errors) = tokio::time::timeout(TIMEOUT, transcode(stdin, stdout, stderr, input))
         .await
         .map_err(|_| format!("ffmpeg timed out after {}s.", TIMEOUT.as_secs()))?;
 

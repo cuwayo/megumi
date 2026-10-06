@@ -218,7 +218,7 @@ fn render_frames(data: &[u8]) -> Result<Vec<RgbaImage>> {
 
     let mut frames = Vec::with_capacity(frame_count);
     for index in 0..frame_count {
-        let frame = metadata.ip + index as f32 * metadata.fr / OUTPUT_FPS;
+        let frame = index as f32 * metadata.fr / OUTPUT_FPS;
         // ThorVG reports the frame it is already showing as an error, which the
         // first frame usually is: the animation starts on `ip` before any call.
         match animation.set_frame(frame) {
@@ -282,6 +282,26 @@ struct LottieMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_is_applied_by_thorvg() {
+        // The same motion, once starting at ip=0 and once at ip=5 with every
+        // keyframe shifted by +5. ThorVG applies the composition's start frame
+        // itself, so both must render identically — and the caller must pass
+        // only the offset derived from the frame index, not ip as well.
+        let zero = render_frames(&moving_tgs()).unwrap();
+        let shifted = render_frames(&moving_tgs_at_ip5()).unwrap();
+        assert_eq!(zero.len(), shifted.len());
+        for (a, b) in zero.iter().zip(&shifted) {
+            assert_eq!(a.as_raw(), b.as_raw(), "ip shift changed the rendering");
+        }
+    }
+
+    /// `moving_tgs` with the composition and its keyframes shifted to ip=5.
+    fn moving_tgs_at_ip5() -> Vec<u8> {
+        let json = r#"{"v":"5.7.4","fr":30,"ip":5,"op":15,"w":64,"h":64,"layers":[{"ty":4,"ip":5,"op":15,"st":0,"ks":{"o":{"a":0,"k":100},"r":{"a":0,"k":0},"p":{"a":1,"k":[{"t":5,"s":[0,0,0],"e":[32,0,0]},{"t":15,"s":[32,0,0]}]},"a":{"a":0,"k":[0,0,0]},"s":{"a":0,"k":[100,100,100]}},"shapes":[{"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[32,32]},"r":{"a":0,"k":0}},{"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100}},{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}],"ao":0}]}"#;
+        gzip(json)
+    }
 
     #[test]
     fn rendered_frames_keep_transparent_pixels() {

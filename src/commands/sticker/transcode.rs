@@ -151,8 +151,13 @@ async fn encode(
     if let Some(decoder) = alpha_decoder(webp) {
         let mut arguments = vec!["-hide_banner", "-loglevel", "error", "-c:v", decoder];
         arguments.extend_from_slice(&tail);
-        if let Ok(sticker) = run_ffmpeg(&arguments, webp).await {
-            return Ok(sticker);
+        match run_ffmpeg(&arguments, webp).await {
+            Ok(sticker) => return Ok(sticker),
+            // Only a build without libvpx warrants the second run; any other
+            // failure (a bad decode, a timeout) is the real answer and must not
+            // buy a retry that spends the whole timeout again.
+            Err(error) if error.contains("Unknown decoder") => {}
+            Err(error) => return Err(error),
         }
     }
 

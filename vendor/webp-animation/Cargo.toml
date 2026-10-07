@@ -1,0 +1,37 @@
+[package]
+name = "webp-animation"
+version = "0.10.0"
+authors = ["Mika Vatanen <blaind@blaind.net>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/blaind/webp-animation"
+description = """
+A high-level Rust wrapper for decoding and encoding WebP animations
+"""
+keywords = ["webp", "webp-animation", "decoder", "encoder"]
+categories = ["multimedia::images", "multimedia", "api-bindings"]
+edition = "2018"
+rust-version = "1.47"
+
+# Vendored from crates.io 0.10.0 to apply the `EncodingConfig::method` fix (see
+# encoder_config.rs): upstream declares the field but never copies it into
+# libwebp, leaving the quality/speed trade-off unreachable. The crate's own
+# binary, examples, and the dev-dependencies only they needed are omitted.
+[lib]
+name = "webp_animation"
+path = "src/lib.rs"
+
+[dependencies]
+image = { version = "0.25", default-features = false, optional = true }
+log = "0.4"
+
+[dependencies.libwebp-sys2]
+version = "0.2"
+features = ["0_5", "0_6", "1_2", "demux", "mux"]
+
+[features]
+static = ["libwebp-sys2/static"]
+
+# Its own workspace root, so its tests can be run from this directory without
+# being pulled into the parent workspace's fmt and clippy gates.
+[workspace]

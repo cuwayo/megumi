@@ -29,3 +29,10 @@ chrono = "0.4.45"
 [workspace]
 members = ["crates/megumi-framework", "crates/megumi-framework-macros"]
 resolver = "3"
+
+# The vendored webp-animation carries the `EncodingConfig::method` fix that
+# upstream 0.10.0 is missing. It stays out of the workspace so CI's fmt and
+# clippy gates keep judging only this repository's code; its own test is run
+# from its manifest (see vendor/webp-animation/PATCH.md).
+[patch.crates-io]
+webp-animation = { path = "vendor/webp-animation" }

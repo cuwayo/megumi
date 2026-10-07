@@ -59,21 +59,46 @@ const fn nzu8(n: u8) -> Option<NonZeroU8> {
 /// handed over is converted here in one pass. Media that already is a WebP of the
 /// sticker's own size and under its limit is the finished sticker, so it is
 /// answered as it stands rather than re-encoded.
+///
+/// An animated sticker is encoded at the source frame rate first, since that is
+/// the best quality. When it does not fit, the overshoot says how much of the
+/// frame rate to give up and the next pass jumps straight to that rate; walking
+/// every rung in between is most of what made this slow. The full ladder stays
+/// as the fallback for media whose frame rate cannot be read or whose size does
+/// not fall the way the estimate assumes.
 pub async fn to_sticker(webp: &[u8], animated: bool) -> Result<Vec<u8>, String> {
     let limit = limit(animated);
     if is_webp(webp) && webp.len() <= limit && dimensions(webp) == Some((SIDE, SIDE)) {
         return Ok(webp.to_vec());
     }
 
-    let attempts = if animated {
-        ANIMATED_ATTEMPTS
+    if !animated {
+        for &(quality, _) in STILL_ATTEMPTS {
+            let sticker = encode(webp, false, quality, None).await?;
+            if sticker.len() <= limit {
+                return Ok(sticker);
+            }
+        }
     } else {
-        STILL_ATTEMPTS
-    };
-    for &(quality, fps_cap) in attempts {
-        let sticker = encode(webp, animated, quality, fps_cap).await?;
-        if sticker.len() <= limit {
-            return Ok(sticker);
+        let full = encode(webp, true, 80, None).await?;
+        if full.len() <= limit {
+            return Ok(full);
+        }
+
+        if let Some(cap) = fitting_fps(webp, full.len(), limit).await {
+            let sticker = encode(webp, true, 80, Some(cap)).await?;
+            if sticker.len() <= limit {
+                return Ok(sticker);
+            }
+        }
+
+        // The first rung was the pass already made, so the fallback resumes
+        // after it.
+        for &(quality, fps_cap) in ANIMATED_ATTEMPTS.iter().skip(1) {
+            let sticker = encode(webp, true, quality, fps_cap).await?;
+            if sticker.len() <= limit {
+                return Ok(sticker);
+            }
         }
     }
 
@@ -83,6 +108,43 @@ pub async fn to_sticker(webp: &[u8], animated: bool) -> Result<Vec<u8>, String> 
         limit / 1024,
         if animated { "animated" } else { "still" }
     ))
+}
+
+/// The frame rate a first encode's overshoot implies will fit, or `None` when
+/// the source's frame rate cannot be read.
+///
+/// An animated WebP's size tracks its frame count, so a sticker that came out
+/// `size` bytes at the source's `fps` needs about `fps * limit / size` to fit.
+/// The estimate is held a little under that so it does not land just over the
+/// line and buy another pass.
+async fn fitting_fps(data: &[u8], size: usize, limit: usize) -> Option<NonZeroU8> {
+    let fps = source_fps(data).await?;
+    let cap = (fps * limit as f32 / size as f32 * 0.9).floor();
+    if cap < 1.0 {
+        return None;
+    }
+    NonZeroU8::new(cap.min(f32::from(u8::MAX)) as u8)
+}
+
+/// The frame rate ffmpeg reports for this media's first video stream, read from
+/// the container rather than by decoding.
+async fn source_fps(data: &[u8]) -> Option<f32> {
+    let text = probe(
+        data,
+        &[
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+        ],
+    )
+    .await?;
+    let text = String::from_utf8_lossy(&text);
+    let (numerator, denominator) = text.trim().split_once('/')?;
+    let fps = numerator.parse::<f32>().ok()? / denominator.parse::<f32>().ok()?;
+    fps.is_finite().then_some(fps).filter(|fps| *fps > 0.0)
 }
 
 pub fn limit(animated: bool) -> usize {
@@ -360,12 +422,9 @@ fn signature_moves(data: &[u8]) -> bool {
 /// module has never heard of still gets its animated allowance if it moves.
 /// A media with no video stream at all — a plain PNG or JPEG — is still.
 pub async fn frames_move(data: &[u8]) -> bool {
-    let mut command = Command::new("ffprobe");
-    command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
+    let Some(text) = probe(
+        data,
+        &[
             "-select_streams",
             "v:0",
             "-count_frames",
@@ -373,39 +432,12 @@ pub async fn frames_move(data: &[u8]) -> bool {
             "stream=nb_read_frames",
             "-of",
             "default=nokey=1:noprint_wrappers=1",
-            "-i",
-            "pipe:0",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-
-    let Ok(mut child) = command.spawn() else {
+        ],
+    )
+    .await
+    else {
         return false;
     };
-    let Some(mut stdin) = child.stdin.take() else {
-        return false;
-    };
-    let Some(stdout) = child.stdout.take() else {
-        return false;
-    };
-
-    let write = async move {
-        // Dropping the handle is what closes ffprobe's input.
-        let _ = stdin.write_all(data).await;
-    };
-    let read = async move {
-        let mut text = Vec::new();
-        let mut stdout = stdout;
-        let _ = stdout.read_to_end(&mut text).await;
-        text
-    };
-    let (_, text) = tokio::time::timeout(TIMEOUT, async { tokio::join!(write, read) })
-        .await
-        .unwrap_or_else(|_| ((), Vec::new()));
-
-    let _ = child.wait().await;
 
     let count: u64 = String::from_utf8_lossy(&text)
         .split_whitespace()
@@ -413,6 +445,44 @@ pub async fn frames_move(data: &[u8]) -> bool {
         .and_then(|first| first.parse().ok())
         .unwrap_or(0);
     count > 1
+}
+
+/// Runs ffprobe over `data` with `arguments` and answers with its stdout, or
+/// `None` if it could not be run or finished in time.
+///
+/// ffprobe takes the media on stdin, so callers pass the bytes they already
+/// hold rather than a path ffmpeg would have to reopen.
+async fn probe(data: &[u8], arguments: &[&str]) -> Option<Vec<u8>> {
+    let mut command = Command::new("ffprobe");
+    command
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(arguments)
+        .arg("-i")
+        .arg("pipe:0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let mut stdout = child.stdout.take()?;
+
+    let write = async move {
+        // Dropping the handle is what closes ffprobe's input.
+        let _ = stdin.write_all(data).await;
+    };
+    let read = async move {
+        let mut text = Vec::new();
+        let _ = stdout.read_to_end(&mut text).await;
+        text
+    };
+    let (_, text) = tokio::time::timeout(TIMEOUT, async { tokio::join!(write, read) })
+        .await
+        .ok()?;
+
+    let _ = child.wait().await;
+    Some(text)
 }
 
 /// Whether this media moves, probing with ffprobe only when its bytes named no

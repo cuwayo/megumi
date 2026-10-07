@@ -13,7 +13,23 @@ const MAX_TGS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SIDE: u32 = 512;
 const MAX_DURATION_SECONDS: f32 = 3.0;
+
+/// The frame rate the composition is rendered at before encoding.
 const OUTPUT_FPS: f32 = 30.0;
+
+/// The frame rates the encoder steps down through when a sticker will not fit.
+///
+/// Frame rate is the lever that matters for Lottie: a Telegram `.tgs` is 512x512
+/// over three seconds, so at 30 fps it is 90 frames and a full-size sticker can
+/// approach a megabyte no matter the quality — libwebp's quality knob barely
+/// moves the needle at this resolution. Dropping to 10 and then 5 fps keeps the
+/// sticker animated while cutting the frame count, which is what the size
+/// actually tracks. Quality is spent only after frame rate is exhausted, the
+/// same ordering the video ladder uses.
+const OUTPUT_FPS_LEVELS: [f32; 3] = [30.0, 10.0, 5.0];
+
+/// The quality steps tried at each frame rate.
+const QUALITY_LEVELS: [f32; 3] = [80.0, 55.0, 30.0];
 
 // ThorVG owns process-global engine state, while pack conversion renders several
 // stickers concurrently. Serialising the engine lifetime keeps those instances
@@ -31,46 +47,115 @@ pub async fn to_sticker(data: &[u8]) -> Result<Vec<u8>> {
     .map_err(|error| anyhow!("Lottie renderer task failed: {error}"))?
 }
 
-/// Encodes rendered frames as an animated sticker WebP, spending quality only
-/// when the first encoding would not fit WhatsApp's size limit.
+/// Encodes rendered frames as an animated sticker WebP, dropping frame rate and
+/// then quality only as far as needed to fit WhatsApp's size limit.
+///
+/// The frames are rendered once at the full rate; lower rates are reached by
+/// keeping every n-th frame, which the timestamps then space out. No re-render
+/// is needed, so stepping down costs only the encoder passes it makes.
+///
+/// The first pass is at the full rate, and its size says how much of the frame
+/// rate to give up: an animated WebP's size tracks its frame count, so the
+/// overshoot points straight at the rate that fits and the ladder's middle rungs
+/// are skipped. The ladder remains as the fallback for a sticker whose size does
+/// not fall that way.
 ///
 /// ffmpeg's `libwebp_anim` is not used: it drops the alpha plane outright for
 /// many frame sequences, which flattens a transparent sticker onto black.
 fn encode_frames(frames: &[RgbaImage]) -> Result<Vec<u8>, String> {
     let (width, height) = (frames[0].width(), frames[0].height());
-    let frame_ms = (1000.0 / OUTPUT_FPS) as i32;
+    let limit = transcode::limit(true);
 
     // Frames whose shape fills its own bounding box make libwebp drop the alpha
-    // plane; retry those with the padding nudged off zero. Every other sticker
-    // keeps its exact pixels and the smaller trimmed-frame encoding.
-    let plain: Vec<&[u8]> = frames
-        .iter()
-        .map(|frame| frame.as_raw().as_slice())
-        .collect();
+    // plane; `attempt` retries those with the padding nudged off zero.
     let has_transparency = frames.iter().any(frame_has_transparency);
 
-    let mut last = Vec::new();
-    for &quality in [80.0, 55.0, 30.0].iter() {
-        let mut sticker = encode_pass(&plain, width, height, frame_ms, quality)
-            .map_err(|error| format!("Could not encode the WebP animation: {error}"))?;
-        if has_transparency && !has_alpha_plane(&sticker) {
-            let kept: Vec<Vec<u8>> = frames.iter().map(keep_alpha_plane).collect();
-            let kept: Vec<&[u8]> = kept.iter().map(Vec::as_slice).collect();
-            sticker = encode_pass(&kept, width, height, frame_ms, quality)
-                .map_err(|error| format!("Could not encode the WebP animation: {error}"))?;
-        }
-        if sticker.len() <= transcode::limit(true) {
+    let mut last = attempt(frames, 1, OUTPUT_FPS, 80.0, width, height, has_transparency)?;
+    if last.len() <= limit {
+        return Ok(last);
+    }
+
+    // The overshoot says how many frames the limit allows; keep every n-th frame
+    // to reach it. The estimate is held a little under the line so it does not
+    // land just over and buy another pass.
+    let wanted = (frames.len() as f32 * limit as f32 / last.len() as f32 * 0.9)
+        .floor()
+        .max(1.0);
+    let step = ((frames.len() as f32 / wanted).ceil() as usize).max(2);
+    if step < frames.len() {
+        let sticker = attempt(
+            frames,
+            step,
+            OUTPUT_FPS / step as f32,
+            80.0,
+            width,
+            height,
+            has_transparency,
+        )?;
+        if sticker.len() <= limit {
             return Ok(sticker);
         }
         last = sticker;
     }
 
+    for &fps in OUTPUT_FPS_LEVELS.iter() {
+        let step = (OUTPUT_FPS / fps).round().max(1.0) as usize;
+        for &quality in QUALITY_LEVELS.iter() {
+            // The full-rate, full-quality pass was already made above.
+            if step == 1 && quality == 80.0 {
+                continue;
+            }
+            let sticker = attempt(frames, step, fps, quality, width, height, has_transparency)?;
+            if sticker.len() <= limit {
+                return Ok(sticker);
+            }
+            last = sticker;
+        }
+    }
+
     Err(format!(
         "That Lottie animation does not fit WhatsApp's 500 KB limit even after reducing \
-         quality ({} KB).",
+         frame rate and quality ({} KB).",
         last.len() / 1024
     ))
 }
+
+/// Runs one libwebp pass over every `step`-th frame at `quality`, retrying with
+/// the alpha plane preserved when libwebp dropped it.
+///
+/// `fps` is the rate the kept frames play at; it spaces the timestamps that
+/// `step` widens.
+fn attempt(
+    frames: &[RgbaImage],
+    step: usize,
+    fps: f32,
+    quality: f32,
+    width: u32,
+    height: u32,
+    has_transparency: bool,
+) -> Result<Vec<u8>, String> {
+    let frame_ms = (1000.0 / fps) as i32;
+    let plain: Vec<&[u8]> = frames
+        .iter()
+        .step_by(step)
+        .map(|frame| frame.as_raw().as_slice())
+        .collect();
+    let mut sticker = encode_pass(&plain, width, height, frame_ms, quality)
+        .map_err(|error| format!("Could not encode the WebP animation: {error}"))?;
+    if has_transparency && !has_alpha_plane(&sticker) {
+        let kept: Vec<Vec<u8>> = frames.iter().step_by(step).map(keep_alpha_plane).collect();
+        let kept: Vec<&[u8]> = kept.iter().map(Vec::as_slice).collect();
+        sticker = encode_pass(&kept, width, height, frame_ms, quality)
+            .map_err(|error| format!("Could not encode the WebP animation: {error}"))?;
+    }
+    Ok(sticker)
+}
+
+/// libwebp's quality/speed trade-off for every Lottie pass, `0` fastest and `6`
+/// slowest. The encoder is the whole cost of this path and it runs up to twice
+/// per sticker, so speed is worth more here than the size a slower method would
+/// buy; the frame-rate ladder absorbs the larger output.
+const ENCODE_METHOD: usize = 0;
 
 /// Runs one libwebp pass over the given frames at the requested quality.
 fn encode_pass(
@@ -80,10 +165,12 @@ fn encode_pass(
     frame_ms: i32,
     quality: f32,
 ) -> Result<Vec<u8>, webp_animation::Error> {
+    let mut encoding_config = webp_animation::EncodingConfig::new_lossy(quality);
+    encoding_config.method = ENCODE_METHOD;
     let mut encoder = webp_animation::Encoder::new_with_options(
         (width, height),
         webp_animation::EncoderOptions {
-            encoding_config: Some(webp_animation::EncodingConfig::new_lossy(quality)),
+            encoding_config: Some(encoding_config),
             ..Default::default()
         },
     )?;

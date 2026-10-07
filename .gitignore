@@ -1,5 +1,11 @@
 # Build output
 /target
+# The vendored crate is its own workspace, so it gets its own target directory.
+/vendor/*/target
+/vendor/*/Cargo.lock
+
+# Media the benchmark example downloads, re-fetchable with the example itself.
+/bench-data
 
 # The linked WhatsApp account's session. Never commit it.
 whatsapp.db*

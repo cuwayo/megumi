@@ -86,11 +86,26 @@ in sync or every command stops compiling.
 `Context`, `Command`, `Framework`, and `FrameworkBuilder` are all generic over user data `U`
 (Poise's `U`), defaulting to `NoData`. A command written against `ctx: Context` stays
 `RegisteredCommand<NoData>`; a bot that shares state aliases `type Context = megumi::Context<Data>`
-and calls `Framework::builder().setup(|| Data { ... })` **before** registering commands. The macro
-projects `U` via `_GetGenerics` from the first parameter's type. `setup` panics if commands were
-already added, because a `Command<NoData>` cannot become a `Command<Data>`.
+and calls `Framework::builder().setup(|client| async move { Ok(Data { ... }) })` **before**
+registering commands. The macro projects `U` via `_GetGenerics` from the first parameter's type.
+`setup` panics if commands were already added, because a `Command<NoData>` cannot become a
+`Command<Data>`.
 
-Dispatch (`Framework::handle` → `Command::invoke`) runs in this order:
+`setup` is **async and connect-driven**: it receives the connected `Arc<Client>` and runs once,
+lazily, on the **first event** the framework sees — not at `build()`. Lazy-on-first-event (rather
+than only on `Connected`) is deliberate: whatsapp-rust can deliver a message before it announces the
+connection, and its default `EventDelivery::Concurrent` spawns each event's callback on its own task,
+so no ordering between event kinds is guaranteed. A failed setup logs and drops every later event.
+
+The framework is **injected into the client**, the way Poise is handed to Serenity's client builder:
+`FrameworkExt::framework` is a trait extension on `whatsapp_rust::BotBuilder` (which has no
+`framework` method of its own) that registers an `on_event` callback running
+`Framework::dispatch_event`. The client drives the framework; the framework's optional `event_handler`
+(a `fn(FrameworkContext<U>, Arc<Event>) -> BoxFuture<Result<(), Error>>`) runs after the framework has
+handled the event's messages. Setup and event-handler failures are **logged**, not routed through
+`on_error`, which expects a command context they lack.
+
+Dispatch (`Framework::dispatch_event` → `dispatch_message` → `Command::invoke`) runs in this order:
 
 1. strip a configured prefix, look the name up in the alias map (only **top-level** commands are registered)
 2. descend into `subcommands` for as long as the next word names a child; `subcommand_required` errors here
@@ -156,8 +171,10 @@ groups commands under. Each group's `context = crate::Context` is how the macro 
   under `sh -c` with a 10 s timeout and replies with the tail of the output.
 
 `Data` (in `src/data.rs`) holds the process start time, pinned in `framework()` so `!uptime` measures the
-whole run, and the news subscription store. `main` builds the framework before connecting, so that instant
-precedes the first command.
+whole run, the news subscription store, and the handle to the running digest task. The start time is pinned
+at build time (outside the async `setup` closure) so it still precedes the first command; the rest is built
+inside `setup`. The digest loop is started by `src/news::event_handler`, the framework's `event_handler`,
+on the `Connected` event — `main` no longer wires `on_connected` itself.
 
 ## Adding a command
 

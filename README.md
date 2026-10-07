@@ -230,10 +230,41 @@ restriction, so those are declared once. Built-in argument types cover strings,
 booleans, numbers, `Option<T>`, `Vec<T>`, and enums deriving
 `ChoiceParameter`, where each variant is one accepted word.
 
-Commands share state through a type parameter: call
-`Framework::builder().setup(|| Data { ... })` and take `megumi::Context<Data>`.
-This bot's `Data` records the process start time so `!uptime` measures the
-whole run.
+Commands share state through a type parameter. Pass `setup` an async closure
+that receives the connected client and returns the data, and take
+`megumi::Context<Data>`:
+
+```rust
+Framework::builder()
+    .setup(|client| async move {
+        Ok(Data { self_jid: client.pn() })
+    })
+    .build()
+```
+
+`setup` runs once, lazily, on the first event — not at build time — so the data
+can depend on the account that only exists after pairing. This bot's `Data`
+records the process start time so `!uptime` measures the whole run.
+
+A `Framework` is injected into the client with `FrameworkExt::framework`, the
+WhatsApp-shaped counterpart to Poise's `ClientBuilder::framework`:
+
+```rust
+use megumi::FrameworkExt;
+
+let bot = Bot::builder()
+    .with_backend(store)
+    .framework(framework())
+    .build()
+    .await?;
+```
+
+The client then drives the framework: it dispatches command messages and runs
+the optional event handler registered with `.event_handler(hook)`. A hook is an
+`async fn(FrameworkContext<Data>, Arc<Event>) -> Result<(), Error>` that sees
+every event the client emits — connects, disconnects, group updates, receipts —
+so non-command behaviour lives with the framework instead of beside it. This
+bot's morning news digest is started from its `Connected` handler.
 
 ## Contributing
 

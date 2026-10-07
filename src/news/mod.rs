@@ -14,10 +14,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
+use megumi::{BoxFuture, Error, Event, FrameworkContext};
 use tracing::{info, warn};
 use whatsapp_rust::Client;
 
 use crate::data::Data;
+use crate::news::store::NewsStore;
 use retry::Backoff;
 
 pub use schedule::morning_of;
@@ -25,18 +27,48 @@ pub use schedule::morning_of;
 /// How often the loop wakes to see whether a morning has started.
 const TICK: Duration = Duration::from_secs(60);
 
+/// Reacts to the client connecting by starting the digest loop.
+///
+/// This is the framework's [`EventHook`](megumi::EventHook): [`crate::framework`]
+/// registers it with `.event_handler(news::event_handler)` rather than wiring
+/// `BotBuilder::on_connected` by hand. On every `Connected` it stops the
+/// previous connection's loop before starting its replacement, so a reconnect
+/// never leaves two loops running.
+pub fn event_handler(
+    ctx: FrameworkContext<Data>,
+    event: Arc<Event>,
+) -> BoxFuture<Result<(), Error>> {
+    Box::pin(async move {
+        if !matches!(&*event, Event::Connected(_)) {
+            return Ok(());
+        }
+        info!("Connected with WhatsApp");
+
+        let mut task = ctx.data.news_task.lock().await;
+        if let Some(previous) = task.take() {
+            previous.abort();
+            let _ = previous.await;
+        }
+        *task = Some(tokio::spawn(run(
+            ctx.client.clone(),
+            Arc::clone(&ctx.data.news),
+        )));
+        Ok(())
+    })
+}
+
 /// Posts the morning digest to every group that asked for it.
 ///
-/// One loop per connection: `main` starts it when WhatsApp connects, stopping
-/// the previous connection's loop first so only one ever runs. Each tick checks
-/// whether a new morning has begun; a morning's
+/// One loop per connection: [`event_handler`] starts it when WhatsApp connects,
+/// stopping the previous connection's loop first so only one ever runs. Each
+/// tick checks whether a new morning has begun; a morning's
 /// digest is fetched once and sent to each subscribed group that has not already
 /// had it. A group is marked done only after its message goes out, so a failure
 /// is retried on a later tick and, since the record is on disk, a digest that
 /// already went out is never posted a second time. A failed fetch is retried on
 /// an increasing delay (see [`retry`]) so an unreachable feed is not asked every
 /// tick for the rest of the morning.
-pub async fn run(client: Arc<Client>, data: Data) {
+pub async fn run(client: Arc<Client>, news: Arc<NewsStore>) {
     let http = reqwest::Client::builder()
         .user_agent("megumi-whatsapp")
         .build()
@@ -45,7 +77,7 @@ pub async fn run(client: Arc<Client>, data: Data) {
     let mut backoff = Backoff::default();
     loop {
         if let Some(day) = morning_of(chrono::Local::now()) {
-            deliver(&client, &data, &http, day, &mut backoff).await;
+            deliver(&client, &news, &http, day, &mut backoff).await;
         }
         tokio::time::sleep(TICK).await;
     }
@@ -54,12 +86,12 @@ pub async fn run(client: Arc<Client>, data: Data) {
 /// Sends `day`'s digest to every subscribed group still waiting for it.
 async fn deliver(
     client: &Client,
-    data: &Data,
+    news: &NewsStore,
     http: &reqwest::Client,
     day: NaiveDate,
     backoff: &mut Backoff,
 ) {
-    let chats = match data.news.enabled_chats() {
+    let chats = match news.enabled_chats() {
         Ok(chats) => chats,
         Err(error) => {
             warn!(%error, "could not read the news subscriptions");
@@ -69,7 +101,7 @@ async fn deliver(
 
     let pending: Vec<String> = chats
         .into_iter()
-        .filter(|chat| match data.news.was_delivered(chat, day) {
+        .filter(|chat| match news.was_delivered(chat, day) {
             Ok(delivered) => !delivered,
             Err(error) => {
                 warn!(%error, chat, "could not read the news delivery record");
@@ -110,7 +142,7 @@ async fn deliver(
 
         match client.send_text(jid, digest.clone()).await {
             Ok(_) => {
-                if let Err(error) = data.news.mark_delivered(chat, day) {
+                if let Err(error) = news.mark_delivered(chat, day) {
                     warn!(chat, %error, "the digest was sent but could not be recorded");
                 }
                 info!(chat, "sent the morning news");

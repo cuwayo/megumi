@@ -25,7 +25,8 @@ pub type Context = megumi::Context<Data>;
 /// Commands are declared in groups (see [`commands`]), which is what the help
 /// listing groups them by. `Data::started` is pinned here, and `main` builds the
 /// framework before anything else, so `!uptime` is process lifetime rather than
-/// time since the first `!uptime`.
+/// time since the first `!uptime`. The pin happens at build time, not inside the
+/// async `setup` closure, so it precedes connecting.
 pub fn framework() -> Framework<Data> {
     // `NEWS_DB` overrides the default of `news.json` beside the session file. Tests
     // build a framework per assertion and never send a digest, so they get an
@@ -37,13 +38,18 @@ pub fn framework() -> Framework<Data> {
             "news.json".to_string()
         }
     });
+    let started = Instant::now();
 
     Framework::builder()
-        .setup(|| Data {
-            started: Instant::now(),
-            news: Arc::new(NewsStore::open(path).unwrap_or_else(|error| panic!("{error}"))),
+        .setup(move |_client| async move {
+            Ok(Data {
+                started,
+                news: Arc::new(NewsStore::open(path).unwrap_or_else(|error| panic!("{error}"))),
+                news_task: tokio::sync::Mutex::new(None),
+            })
         })
         .prefix("!")
+        .event_handler(news::event_handler)
         .groups([
             commands::utility(),
             commands::media(),

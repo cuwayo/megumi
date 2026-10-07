@@ -100,10 +100,10 @@ async fn get_file_path(
         .get(&url)
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.without_url().to_string())?
         .json()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.without_url().to_string())?;
     if !response.ok {
         return Err(format!("getFile refused: {:?}", response.description));
     }
@@ -120,11 +120,19 @@ async fn download_file(
     file_path: &str,
 ) -> Result<Vec<u8>, String> {
     let url = format!("{base}/file/bot{token}/{file_path}");
-    let response = http.get(&url).send().await.map_err(|e| e.to_string())?;
+    let response = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.without_url().to_string())?;
     if !response.status().is_success() {
         return Err(format!("download HTTP {}", response.status()));
     }
-    Ok(response.bytes().await.map_err(|e| e.to_string())?.to_vec())
+    Ok(response
+        .bytes()
+        .await
+        .map_err(|e| e.without_url().to_string())?
+        .to_vec())
 }
 
 fn ms(duration: Duration) -> f64 {

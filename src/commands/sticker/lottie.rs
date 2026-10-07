@@ -82,6 +82,10 @@ fn encode_frames(frames: &[RgbaImage]) -> Result<Vec<u8>, String> {
         .floor()
         .max(1.0);
     let step = ((frames.len() as f32 / wanted).ceil() as usize).max(2);
+    // The step the estimate pass actually used, so the ladder below can skip the
+    // rung that would repeat it. It stays `None` when the estimate named every
+    // frame, because that pass is skipped.
+    let mut estimated_step = None;
     if step < frames.len() {
         let sticker = attempt(
             frames,
@@ -95,14 +99,16 @@ fn encode_frames(frames: &[RgbaImage]) -> Result<Vec<u8>, String> {
         if sticker.len() <= limit {
             return Ok(sticker);
         }
+        estimated_step = Some(step);
         last = sticker;
     }
 
     for &fps in OUTPUT_FPS_LEVELS.iter() {
         let step = (OUTPUT_FPS / fps).round().max(1.0) as usize;
         for &quality in QUALITY_LEVELS.iter() {
-            // The full-rate, full-quality pass was already made above.
-            if step == 1 && quality == 80.0 {
+            // The full-rate and estimated passes were already made above; skip
+            // the rungs that would repeat them.
+            if quality == 80.0 && (step == 1 || Some(step) == estimated_step) {
                 continue;
             }
             let sticker = attempt(frames, step, fps, quality, width, height, has_transparency)?;

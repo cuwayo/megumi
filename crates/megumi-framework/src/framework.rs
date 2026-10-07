@@ -262,7 +262,13 @@ impl<U: FrameworkData> Framework<U> {
             // A previous event already took the closure and its setup panicked
             // before storing anything. Fail closed and store `None` below, so
             // this does not take the lock on every event from here on.
-            None => None,
+            None => {
+                error!(
+                    "the framework setup was interrupted before completing; dropping this and \
+                     every later event"
+                );
+                None
+            }
         };
         let _ = self.user_data.resolved.set(data.clone());
         data

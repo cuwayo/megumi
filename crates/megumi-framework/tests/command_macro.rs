@@ -262,16 +262,21 @@ fn data_check(ctx: DataContext) -> megumi::BoxFuture<Result<bool, Error>> {
 
 #[test]
 fn a_typed_context_projects_its_data_type_onto_the_framework() {
+    // `setup` runs on the first event, not here, so this asserts only that the
+    // builder accepts the async setup and projects `Data` through the command;
+    // `events.rs` drives the same framework with a real client to check the data
+    // actually reaches the command.
     let framework = Framework::builder()
-        .setup(|| Data {
-            invocations: AtomicU64::new(7),
+        .setup(|_client| async move {
+            Ok(Data {
+                invocations: AtomicU64::new(7),
+            })
         })
         .prefix("!")
         .command_check(data_check)
         .commands([counted()])
         .build();
 
-    assert_eq!(framework.user_data().invocations.load(Ordering::Relaxed), 7);
     let help = framework.command_help("counted").unwrap();
     assert!(help.contains("!counted"), "{help}");
 }
@@ -279,9 +284,13 @@ fn a_typed_context_projects_its_data_type_onto_the_framework() {
 #[test]
 #[should_panic(expected = "setup")]
 fn setup_refuses_commands_already_registered() {
-    let _ = Framework::builder().commands([add()]).setup(|| Data {
-        invocations: AtomicU64::new(0),
-    });
+    let _ = Framework::builder()
+        .commands([add()])
+        .setup(|_client| async move {
+            Ok(Data {
+                invocations: AtomicU64::new(0),
+            })
+        });
 }
 
 #[test]

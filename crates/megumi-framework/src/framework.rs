@@ -3,8 +3,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tracing::warn;
-use whatsapp_rust::bot::MessageContext;
+use tracing::{error, warn};
+use whatsapp_rust::Client;
+use whatsapp_rust::bot::{BotBuilder, MessageContext};
+use whatsapp_rust::types::events::{Event, EventKind};
 
 use crate::DEFAULT_PREFIX;
 use crate::args::Args;
@@ -19,6 +21,76 @@ use crate::reply::CreateReply;
 /// A future that outlives the call that produced it, the shape poise uses for
 /// its `on_error` callback.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+/// The one-shot closure that produces the framework's user data, poise's
+/// `setup`, run by the first event to reach [`Framework::resolve_user_data`].
+///
+/// A framework that never called `setup` has no closure: [`UserDataCell::ready`]
+/// starts it already resolved, so it skips the lazy step entirely.
+type SetupFn<U> = Box<dyn FnOnce(Arc<Client>) -> BoxFuture<Result<U, Error>> + Send + Sync>;
+
+/// The framework's user data: produced once by `setup`, then read by every event
+/// without touching a lock.
+///
+/// The read is on the per-event path, and whatsapp-rust dispatches each event on
+/// its own task, so the steady-state read must not contend. `resolved` is a
+/// [`std::sync::OnceLock`], read with a plain atomic load; `setup` is a
+/// `tokio::sync::Mutex` locked only by the first event, and held across the
+/// setup future so events arriving together wait for that one run rather than
+/// racing. Once `resolved` is set the fast path returns before the lock is
+/// touched.
+struct UserDataCell<U> {
+    /// `Some(data)` once setup succeeded, `Some(None)` once it failed; `None`
+    /// until the first event resolves it.
+    resolved: std::sync::OnceLock<Option<Arc<U>>>,
+    /// The setup closure, taken by the first event. Empty once it has run.
+    setup: tokio::sync::Mutex<Option<SetupFn<U>>>,
+}
+
+impl<U: FrameworkData> UserDataCell<U> {
+    /// A cell whose value is already there, for a framework with no `setup`.
+    ///
+    /// The fast path works from the first event, so `NoData` costs no lazy step.
+    fn ready(data: Arc<U>) -> Self {
+        let resolved = std::sync::OnceLock::new();
+        let _ = resolved.set(Some(data));
+        Self {
+            resolved,
+            setup: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// A cell that runs `setup` on the first event to arrive.
+    fn pending(setup: SetupFn<U>) -> Self {
+        Self {
+            resolved: std::sync::OnceLock::new(),
+            setup: tokio::sync::Mutex::new(Some(setup)),
+        }
+    }
+}
+
+/// A hook that sees every event the client dispatches, poise's
+/// `FrameworkOptions::event_handler`.
+///
+/// It runs after the framework has handled the event's messages, and receives a
+/// [`FrameworkContext`] so it can reach the client and the user data. Returning
+/// an error is logged; it is not routed through the command `on_error`, which
+/// expects a command context this hook has none of.
+pub type EventHook<U = NoData> =
+    fn(FrameworkContext<U>, Arc<Event>) -> BoxFuture<Result<(), Error>>;
+
+/// The view an [`EventHook`] runs with: the connected client and the user data.
+///
+/// This is poise's `FrameworkContext`, reduced to what WhatsApp offers. The
+/// fields are owned `Arc`s rather than borrows because the framework's
+/// [`BoxFuture`] is `'static` and whatsapp-rust hands each event over as an
+/// `Arc`, so there is nothing to borrow from.
+pub struct FrameworkContext<U: FrameworkData = NoData> {
+    /// The client that dispatched the event.
+    pub client: Arc<Client>,
+    /// The framework's user data, already initialized.
+    pub data: Arc<U>,
+}
 
 /// Called with the error the dispatcher produced and the context it happened in.
 ///
@@ -68,8 +140,10 @@ pub fn default_on_error<U: FrameworkData>(error: FrameworkError, ctx: Context<U>
 
 /// A registered command registry, and the policy the dispatcher applies to it.
 ///
-/// Build one with [`Framework::builder`], and hand it to
-/// [`install`] to get the callback the WhatsApp client runs for each message.
+/// Build one with [`Framework::builder`], and inject it into the WhatsApp client
+/// with [`FrameworkExt::framework`], which is how poise hands its framework to
+/// Serenity's client builder. The client then runs [`Framework::dispatch_event`]
+/// for every event.
 pub struct Framework<U: FrameworkData = NoData> {
     prefixes: Arc<Vec<String>>,
     /// The commands and group descriptions, shared with every `Context` so help
@@ -80,17 +154,18 @@ pub struct Framework<U: FrameworkData = NoData> {
     post_command: Hook<U>,
     command_check: Option<Check<U>>,
     reply_callback: Option<ReplyCallback<U>>,
+    event_handler: Option<EventHook<U>>,
     skip_checks_for_owners: bool,
     manual_cooldowns: bool,
     /// When true, a message that carries the prefix but no known command is
     /// left alone instead of being answered. Poise's `non_command_message`
     /// fills this role by simply not being set.
     report_unknown_commands: bool,
-    /// The bot's user data, shared by reference with every context the
-    /// dispatcher builds. Poise fills its equivalent from a `setup` callback on
-    /// Discord's Ready event; WhatsApp has no such event, so the value is
-    /// supplied to the builder and lives for the framework's whole life.
-    data: Arc<U>,
+    /// The bot's user data. Poise fills its equivalent from an async `setup`
+    /// callback on Discord's Ready event; WhatsApp has no guaranteed ordering
+    /// between its events, so the value is produced lazily on the first event
+    /// and shared with every context the dispatcher builds.
+    user_data: Arc<UserDataCell<U>>,
 }
 
 impl<U: FrameworkData> Clone for Framework<U> {
@@ -103,10 +178,11 @@ impl<U: FrameworkData> Clone for Framework<U> {
             post_command: self.post_command,
             command_check: self.command_check,
             reply_callback: self.reply_callback,
+            event_handler: self.event_handler,
             skip_checks_for_owners: self.skip_checks_for_owners,
             manual_cooldowns: self.manual_cooldowns,
             report_unknown_commands: self.report_unknown_commands,
-            data: Arc::clone(&self.data),
+            user_data: Arc::clone(&self.user_data),
         }
     }
 }
@@ -122,77 +198,144 @@ impl Framework<NoData> {
 }
 
 impl<U: FrameworkData> Framework<U> {
+    /// Handles one event from the client: dispatches the messages it carries,
+    /// then runs the [`EventHook`] if the framework set one.
+    ///
+    /// This is what [`FrameworkExt::framework`] wires the client to, so it is
+    /// the framework's whole entry point, poise's `dispatch`. The user data is
+    /// resolved here — built by `setup` on the first event, reused after — and a
+    /// framework whose setup failed drops the event rather than running a
+    /// command that would find no data.
+    pub async fn dispatch_event(&self, client: Arc<Client>, event: Arc<Event>) {
+        let Some(data) = self.resolve_user_data(&client).await else {
+            return;
+        };
+
+        // A message event carries one or more messages; every other kind
+        // carries none, so this loop is a no-op for them.
+        if let Some(batch) = event.as_messages() {
+            for inbound in batch.iter() {
+                let message = MessageContext::from_inbound(inbound, Arc::clone(&client));
+                self.dispatch_message(message, Arc::clone(&data)).await;
+            }
+        }
+
+        if let Some(handler) = self.event_handler {
+            let ctx = FrameworkContext {
+                client,
+                data: Arc::clone(&data),
+            };
+            if let Err(error) = handler(ctx, event).await {
+                error!(%error, "the framework event handler failed");
+            }
+        }
+    }
+
+    /// Resolves the user data, running `setup` on the first call.
+    ///
+    /// The steady state is a lock-free atomic load. Only when the value is not
+    /// yet there does this take the setup lock, and it holds it across the setup
+    /// future: an event arriving while the first is still setting up waits on
+    /// the lock and then finds the value in the re-check, so `setup` runs once
+    /// and no event observes a half-built cell. A failure is stored as `None`,
+    /// so every later event returns `None` without retrying or logging again.
+    async fn resolve_user_data(&self, client: &Arc<Client>) -> Option<Arc<U>> {
+        if let Some(data) = self.user_data.resolved.get() {
+            return data.clone();
+        }
+
+        let mut setup = self.user_data.setup.lock().await;
+        // Re-check under the lock: the first event may have finished setup while
+        // this one was waiting for it.
+        if let Some(data) = self.user_data.resolved.get() {
+            return data.clone();
+        }
+
+        let data = match setup.take() {
+            Some(setup) => match setup(Arc::clone(client)).await {
+                Ok(data) => Some(Arc::new(data)),
+                Err(error) => {
+                    error!(%error, "the framework setup failed");
+                    None
+                }
+            },
+            // A previous event already took the closure and its setup panicked
+            // before storing anything. Fail closed and store `None` below, so
+            // this does not take the lock on every event from here on.
+            None => None,
+        };
+        let _ = self.user_data.resolved.set(data.clone());
+        data
+    }
+
     /// Dispatches one message: resolves the command it names, runs the gates,
     /// and invokes it, reporting any failure through the command's `on_error` or
     /// the framework's.
     ///
-    /// This is the whole hot path, so it is written to allocate as little as
+    /// This is the hot path, so it is written to allocate as little as
     /// possible: a message that is not a command for this bot returns after one
     /// prefix check. An unknown command that will be answered owns the prefix
     /// and the name it did not recognise; one that will be ignored is still
     /// classified, then dropped.
-    pub fn handle(&self, message: MessageContext) -> impl Future<Output = ()> + Send {
-        let framework = self.clone();
-        async move {
-            // The route is owned, so the borrow of `message` ends here and the
-            // message can move into the context below.
-            let route = {
-                let Some(text) = command_text(&message.message) else {
-                    return;
-                };
-                classify(text, &framework.prefixes, &framework.registry)
+    async fn dispatch_message(&self, message: MessageContext, data: Arc<U>) {
+        // The route is owned, so the borrow of `message` ends here and the
+        // message can move into the context below.
+        let route = {
+            let Some(text) = command_text(&message.message) else {
+                return;
             };
+            classify(text, &self.prefixes, &self.registry)
+        };
 
-            match route {
-                Route::NotACommand => {}
-                Route::Unknown { prefix, command } => {
-                    if !framework.report_unknown_commands {
-                        return;
-                    }
-                    let mut ctx = framework.context(message);
-                    ctx.prefix = prefix;
-                    ctx.commands = Some(Arc::clone(&framework.registry));
-                    ctx.reply_callback = framework.reply_callback;
-                    (framework.on_error)(FrameworkError::UnknownCommand { command }, ctx).await;
+        match route {
+            Route::NotACommand => {}
+            Route::Unknown { prefix, command } => {
+                if !self.report_unknown_commands {
+                    return;
                 }
-                Route::Command {
-                    prefix,
-                    command,
-                    params,
-                    invoked_name,
-                } => {
-                    let mut ctx = framework.context(message);
-                    ctx.args = Args::from_owned(params);
-                    ctx.commands = Some(Arc::clone(&framework.registry));
-                    ctx.prefix = prefix;
-                    ctx.invoked_command_name = invoked_name;
-                    ctx.pre_command = framework.pre_command;
-                    ctx.post_command = framework.post_command;
-                    ctx.command_check = framework.command_check;
-                    ctx.reply_callback = framework.reply_callback;
-                    ctx.skip_checks_for_owners = framework.skip_checks_for_owners;
-                    ctx.manual_cooldowns = framework.manual_cooldowns;
-                    ctx.command = Some(Arc::clone(&command));
+                let mut ctx = self.context(message, data);
+                ctx.prefix = prefix;
+                ctx.commands = Some(Arc::clone(&self.registry));
+                ctx.reply_callback = self.reply_callback;
+                (self.on_error)(FrameworkError::UnknownCommand { command }, ctx).await;
+            }
+            Route::Command {
+                prefix,
+                command,
+                params,
+                invoked_name,
+            } => {
+                let mut ctx = self.context(message, data);
+                ctx.args = Args::from_owned(params);
+                ctx.commands = Some(Arc::clone(&self.registry));
+                ctx.prefix = prefix;
+                ctx.invoked_command_name = invoked_name;
+                ctx.pre_command = self.pre_command;
+                ctx.post_command = self.post_command;
+                ctx.command_check = self.command_check;
+                ctx.reply_callback = self.reply_callback;
+                ctx.skip_checks_for_owners = self.skip_checks_for_owners;
+                ctx.manual_cooldowns = self.manual_cooldowns;
+                ctx.command = Some(Arc::clone(&command));
 
-                    if command.subcommand_required {
-                        let error = FrameworkError::SubcommandRequired {
-                            command: command.name.clone(),
-                            subcommands: command
-                                .subcommands
-                                .iter()
-                                .map(|child| child.name.clone())
-                                .collect(),
-                        };
-                        let handler = command.on_error.unwrap_or(framework.on_error);
-                        handler(error, ctx).await;
-                        return;
-                    }
+                if command.subcommand_required {
+                    let error = FrameworkError::SubcommandRequired {
+                        command: command.name.clone(),
+                        subcommands: command
+                            .subcommands
+                            .iter()
+                            .map(|child| child.name.clone())
+                            .collect(),
+                    };
+                    let handler = command.on_error.unwrap_or(self.on_error);
+                    handler(error, ctx).await;
+                    return;
+                }
 
-                    // `Command::invoke` traces the outcome; the error handler answers the chat.
-                    if let Err(error) = command.invoke(ctx.clone()).await {
-                        let handler = command.on_error.unwrap_or(framework.on_error);
-                        handler(error, ctx).await;
-                    }
+                // `Command::invoke` traces the outcome; the error handler answers the chat.
+                if let Err(error) = command.invoke(ctx.clone()).await {
+                    let handler = command.on_error.unwrap_or(self.on_error);
+                    handler(error, ctx).await;
                 }
             }
         }
@@ -350,37 +493,44 @@ pub struct FrameworkBuilder<U: FrameworkData = NoData> {
     post_command: Hook<U>,
     command_check: Option<Check<U>>,
     reply_callback: Option<ReplyCallback<U>>,
+    event_handler: Option<EventHook<U>>,
     skip_checks_for_owners: bool,
     manual_cooldowns: bool,
     report_unknown_commands: bool,
-    data: U,
+    user_data: UserDataCell<U>,
 }
 
 impl FrameworkBuilder<NoData> {
-    /// Switches this builder to one whose commands share `data`.
+    /// Switches this builder to one whose commands share the data `setup`
+    /// returns, poise's `FrameworkBuilder::setup`.
     ///
-    /// This is poise's `FrameworkBuilder::setup`, minus the Discord Ready event
-    /// it waits for: WhatsApp has nothing to wait for, so the data exists as
-    /// soon as the framework is built and [`Context::data`] never blocks.
+    /// The closure is async and is handed the connected [`Client`], so the data
+    /// can depend on the account that only exists after pairing. It runs once,
+    /// lazily, on the first event the framework sees — not at build time, and
+    /// not only on `Connected`, because WhatsApp may deliver a message before it
+    /// announces the connection. A failed setup is logged and drops every event.
     ///
     /// ```no_run
     /// use std::sync::atomic::AtomicU64;
-    /// use megumi::Framework;
+    /// use megumi::{Error, Framework};
     ///
     /// struct Data {
     ///     invocations: AtomicU64,
     /// }
     ///
     /// let framework = Framework::builder()
-    ///     .setup(|| Data { invocations: AtomicU64::new(0) })
+    ///     .setup(|_client| async move {
+    ///         Ok(Data { invocations: AtomicU64::new(0) })
+    ///     })
     ///     .prefix("!")
     ///     .build();
     /// ```
     ///
     /// Prefixes and the boolean policy flags already set on this builder are
     /// kept. Hooks (`on_error`, `pre_command`, `post_command`, `command_check`,
-    /// `reply_callback`) cannot follow: they are `fn` pointers of `U`, and this
-    /// method changes `U` from [`NoData`] to `D`. Attach them after `setup`.
+    /// `reply_callback`, `event_handler`) cannot follow: they are `fn` pointers
+    /// of `U`, and this method changes `U` from [`NoData`] to `D`. Attach them
+    /// after `setup`.
     ///
     /// # Panics
     ///
@@ -388,7 +538,12 @@ impl FrameworkBuilder<NoData> {
     /// parameterised by different data types, so a `Command<NoData>` registered
     /// before `setup` cannot become a `Command<D>` and would be dropped
     /// silently; call `setup` first, as poise does.
-    pub fn setup<D: FrameworkData>(self, setup: impl FnOnce() -> D) -> FrameworkBuilder<D> {
+    pub fn setup<D, F, Fut>(self, setup: F) -> FrameworkBuilder<D>
+    where
+        D: FrameworkData,
+        F: FnOnce(Arc<Client>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<D, Error>> + Send + 'static,
+    {
         assert!(
             self.commands.is_empty(),
             "`setup` must be called before any command is added: a command \
@@ -403,16 +558,17 @@ impl FrameworkBuilder<NoData> {
             post_command: crate::command::noop_hook,
             command_check: None,
             reply_callback: None,
+            event_handler: None,
             skip_checks_for_owners: self.skip_checks_for_owners,
             manual_cooldowns: self.manual_cooldowns,
             report_unknown_commands: self.report_unknown_commands,
-            data: setup(),
+            user_data: UserDataCell::pending(Box::new(move |client| Box::pin(setup(client)))),
         }
     }
 }
 
 impl<U: FrameworkData> FrameworkBuilder<U> {
-    fn fresh(data: U) -> Self {
+    fn fresh(user_data: UserDataCell<U>) -> Self {
         Self {
             prefixes: vec![DEFAULT_PREFIX.to_string()],
             commands: Vec::new(),
@@ -422,10 +578,11 @@ impl<U: FrameworkData> FrameworkBuilder<U> {
             post_command: crate::command::noop_hook,
             command_check: None,
             reply_callback: None,
+            event_handler: None,
             skip_checks_for_owners: false,
             manual_cooldowns: false,
             report_unknown_commands: true,
-            data,
+            user_data,
         }
     }
 
@@ -477,6 +634,17 @@ impl<U: FrameworkData> FrameworkBuilder<U> {
     /// before it goes out.
     pub fn reply_callback(mut self, callback: ReplyCallback<U>) -> Self {
         self.reply_callback = Some(callback);
+        self
+    }
+
+    /// Called for every event the client dispatches, poise's `event_handler`.
+    ///
+    /// The hook runs after the framework has handled the event's messages, so a
+    /// handler can react to non-command traffic — a group update, a connect or
+    /// logout, a receipt. It is the WhatsApp-shaped counterpart to poise's
+    /// single generic event handler.
+    pub fn event_handler(mut self, handler: EventHook<U>) -> Self {
+        self.event_handler = Some(handler);
         self
     }
 
@@ -558,10 +726,11 @@ impl<U: FrameworkData> FrameworkBuilder<U> {
             post_command: self.post_command,
             command_check: self.command_check,
             reply_callback: self.reply_callback,
+            event_handler: self.event_handler,
             skip_checks_for_owners: self.skip_checks_for_owners,
             manual_cooldowns: self.manual_cooldowns,
             report_unknown_commands: self.report_unknown_commands,
-            data: Arc::new(self.data),
+            user_data: Arc::new(self.user_data),
         }
     }
 }
@@ -569,7 +738,7 @@ impl<U: FrameworkData> FrameworkBuilder<U> {
 impl FrameworkBuilder<NoData> {
     /// A builder with the default prefix and no commands.
     pub fn new() -> Self {
-        Self::fresh(NoData)
+        Self::fresh(UserDataCell::ready(Arc::new(NoData)))
     }
 }
 
@@ -580,9 +749,9 @@ impl Default for FrameworkBuilder<NoData> {
 }
 
 impl<U: FrameworkData> Framework<U> {
-    /// A context carrying this framework's user data, for a message that has not
-    /// yet been recognised as a command.
-    fn context(&self, message: MessageContext) -> Context<U> {
+    /// A context carrying `data` for a message that has not yet been recognised
+    /// as a command.
+    fn context(&self, message: MessageContext, data: Arc<U>) -> Context<U> {
         Context {
             message: Arc::new(message),
             args: Args::default(),
@@ -599,16 +768,58 @@ impl<U: FrameworkData> Framework<U> {
             reply_callback: None,
             skip_checks_for_owners: false,
             manual_cooldowns: false,
-            data: Some(Arc::clone(&self.data)),
+            data: Some(data),
         }
     }
+}
 
-    /// The user data this framework was built with.
-    ///
-    /// Poise exposes the same value as `Framework::user_data`, which blocks
-    /// until Discord's Ready event; here the data exists from [`build`](FrameworkBuilder::build).
-    pub fn user_data(&self) -> &U {
-        &self.data
+/// Injects a [`Framework`] into a WhatsApp [`BotBuilder`], the way poise is
+/// handed to Serenity's client builder with `ClientBuilder::framework`.
+///
+/// ```no_run
+/// use megumi::{Framework, FrameworkExt};
+/// use whatsapp_rust::bot::Bot;
+/// # async fn run(store: whatsapp_rust::store::SqliteStore) -> Result<(), Box<dyn std::error::Error>> {
+/// let bot = Bot::builder()
+///     .with_backend(store)
+///     .framework(Framework::builder().build())
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// It registers a callback that hands each event to
+/// [`Framework::dispatch_event`], so the client drives the framework rather than
+/// the other way round. The callback is scoped to the kinds the framework
+/// actually handles: message events always, and every other kind only when an
+/// [`event_handler`](FrameworkBuilder::event_handler) was set. This is the
+/// WhatsApp-shaped stand-in for Serenity's `ClientBuilder::framework`, which
+/// whatsapp-rust's `BotBuilder` has no equivalent of.
+pub trait FrameworkExt: Sized {
+    /// Registers `framework` to handle the events it subscribes to.
+    fn framework<U: FrameworkData + 'static>(self, framework: Framework<U>) -> Self;
+}
+
+impl<B, T, H, R> FrameworkExt for BotBuilder<B, T, H, R> {
+    fn framework<U: FrameworkData + 'static>(self, framework: Framework<U>) -> Self {
+        // Only an event handler wants every kind. A framework without one
+        // subscribes to `Messages` alone, so whatsapp-rust never materializes
+        // the events the framework would ignore — a large `HistorySync` blob,
+        // a device-list update — which the all-kinds interest would force it to
+        // build and hand over on every dispatch.
+        let wants_every_kind = framework.event_handler.is_some();
+        let handler = move |event: Arc<Event>, client: Arc<Client>| {
+            let framework = framework.clone();
+            async move {
+                framework.dispatch_event(client, event).await;
+            }
+        };
+        if wants_every_kind {
+            self.on_event(handler)
+        } else {
+            self.on_event_for(&[EventKind::Messages], handler)
+        }
     }
 }
 
@@ -623,22 +834,6 @@ fn stamp_group<U: FrameworkData>(command: &mut Command<U>, name: &str) {
         if let Some(child) = Arc::get_mut(child) {
             stamp_group(child, name);
         }
-    }
-}
-
-/// The callback a WhatsApp client runs for each message, dispatching it through
-/// `framework`.
-///
-/// This is what [`Bot::on_message`](whatsapp_rust::bot::Bot) is handed; it
-/// clones the framework per message, which is a handful of refcount bumps.
-pub fn install<U: FrameworkData + 'static>(
-    framework: Framework<U>,
-) -> impl Fn(MessageContext) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-    move |context: MessageContext| {
-        let framework = framework.clone();
-        Box::pin(async move {
-            framework.handle(context).await;
-        })
     }
 }
 

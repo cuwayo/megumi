@@ -6,8 +6,14 @@
 //!
 //! [`Context`], [`Command`], and [`Framework`] are generic over user data `U`
 //! (Poise's `U`), defaulting to [`NoData`]. Call
-//! [`FrameworkBuilder::setup`](crate::FrameworkBuilder::setup) to supply a
-//! shared value every command reaches through [`Context::data`].
+//! [`FrameworkBuilder::setup`](crate::FrameworkBuilder::setup) to supply an
+//! async closure that builds that data on the first event, with the connected
+//! client in hand; every command reaches it through [`Context::data`].
+//!
+//! A [`Framework`] is injected into the WhatsApp client with
+//! [`FrameworkExt::framework`], poise's `ClientBuilder::framework`: the client
+//! then drives the framework, which dispatches command messages and runs an
+//! optional [`EventHook`] for every event.
 //!
 //! Module map:
 //!
@@ -16,7 +22,7 @@
 //! - `context` - the [`Context`] a command body runs with
 //! - `cooldown` - per-command cooldowns
 //! - `error` - [`Error`], [`FrameworkError`], and [`CommandResult`]
-//! - `framework` - the [`Framework`] registry, its builder, and [`install`]
+//! - `framework` - the [`Framework`] registry, its builder, [`FrameworkExt`], and event dispatch
 //! - `group` - the optional [`CommandGroup`] container
 //! - `help` - rendered help text
 //! - `media` - [`Attachment`] a command reads, [`CreateAttachment`] a reply sends
@@ -49,8 +55,8 @@ pub use crate::cooldown::{
 };
 pub use crate::error::{CommandResult, Error, FrameworkError};
 pub use crate::framework::{
-    BoxFuture, Check, ErrorHandler, Framework, FrameworkBuilder, Hook, ReplyCallback,
-    default_on_error, install,
+    BoxFuture, Check, ErrorHandler, EventHook, Framework, FrameworkBuilder, FrameworkContext,
+    FrameworkExt, Hook, ReplyCallback, default_on_error,
 };
 pub use crate::group::CommandGroup;
 pub use crate::media::{
@@ -68,6 +74,7 @@ pub use crate::reply::{CreateReply, LinkCard, LinkPreview};
 pub use megumi_framework_macros::{ChoiceParameter, command, group};
 pub use whatsapp_rust::bot::MessageContext;
 pub use whatsapp_rust::prelude::MessageExt;
+pub use whatsapp_rust::types::events::Event;
 pub use whatsapp_rust::wacore_binary::JidExt;
 pub use whatsapp_rust::{GroupParticipant, Jid, ParticipantType};
 

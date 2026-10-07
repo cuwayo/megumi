@@ -75,7 +75,9 @@ impl<U: FrameworkData> _GetGenerics for Context<U> {
 ///
 /// fn framework() -> Framework<Data> {
 ///     Framework::builder()
-///         .setup(|| Data { invocations: AtomicU64::new(0) })
+///         .setup(|_client| async move {
+///             Ok(Data { invocations: AtomicU64::new(0) })
+///         })
 ///         .build()
 /// }
 /// ```

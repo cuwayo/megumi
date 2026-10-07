@@ -11,6 +11,11 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "c65b
 megumi-framework-macros = { path = "../megumi-framework-macros" }
 tracing = { version = "0.1.44", features = ["async-await", "attributes"] }
 itertools = "0.15.0"
+tokio = { version = "1.53.1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
+
+[[bench]]
+name = "dispatch"
+harness = false

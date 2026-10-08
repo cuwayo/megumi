@@ -27,34 +27,50 @@ pub use schedule::morning_of;
 /// How often the loop wakes to see whether a morning has started.
 const TICK: Duration = Duration::from_secs(60);
 
-/// Reacts to the client connecting by starting the digest loop.
+/// Reacts to the connection lifecycle by starting or stopping the digest loop.
 ///
 /// This is the framework's [`EventHook`](megumi::EventHook): [`crate::framework`]
 /// registers it with `.event_handler(news::event_handler)` rather than wiring
-/// `BotBuilder::on_connected` by hand. On every `Connected` it stops the
-/// previous connection's loop before starting its replacement, so a reconnect
-/// never leaves two loops running.
+/// `BotBuilder::on_connected` by hand. On `Connected` it stops the previous
+/// connection's loop before starting its replacement, so a reconnect never
+/// leaves two loops running. On `Disconnected` or `LoggedOut` it stops the loop,
+/// so a dropped or unlinked session does not leave a loop ticking against a dead
+/// client (and holding it alive) until the process ends.
 pub fn event_handler(
     ctx: FrameworkContext<Data>,
     event: Arc<Event>,
 ) -> BoxFuture<Result<(), Error>> {
     Box::pin(async move {
-        if !matches!(&*event, Event::Connected(_)) {
-            return Ok(());
+        match &*event {
+            Event::Connected(_) => {
+                info!("Connected with WhatsApp");
+                let next = tokio::spawn(run(ctx.client.clone(), Arc::clone(&ctx.data.news)));
+                replace_digest(&ctx.data.news_task, Some(next)).await;
+            }
+            Event::Disconnected(_) | Event::LoggedOut(_) => {
+                replace_digest(&ctx.data.news_task, None).await;
+            }
+            _ => {}
         }
-        info!("Connected with WhatsApp");
-
-        let mut task = ctx.data.news_task.lock().await;
-        if let Some(previous) = task.take() {
-            previous.abort();
-            let _ = previous.await;
-        }
-        *task = Some(tokio::spawn(run(
-            ctx.client.clone(),
-            Arc::clone(&ctx.data.news),
-        )));
         Ok(())
     })
+}
+
+/// Swaps the digest loop for `next`, stopping the running one first and waiting
+/// for it to finish so the two never overlap.
+///
+/// The whole swap is one critical section, so two `Connected` events arriving
+/// together cannot both start a loop.
+async fn replace_digest(
+    task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    next: Option<tokio::task::JoinHandle<()>>,
+) {
+    let mut guard = task.lock().await;
+    if let Some(previous) = guard.take() {
+        previous.abort();
+        let _ = previous.await;
+    }
+    *guard = next;
 }
 
 /// Posts the morning digest to every group that asked for it.

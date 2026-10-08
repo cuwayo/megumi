@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use megumi::{BoxFuture, Context, Error, Event, Framework, FrameworkContext, NoData, command};
 use whatsapp_rust::bot::Bot;
+use whatsapp_rust::futures::FutureExt;
 use whatsapp_rust::types::events::{BatchOrigin, Connected, InboundMessage, MessageBatch};
 use whatsapp_rust::types::message::MessageInfo;
 use whatsapp_rust::wacore::store::InMemoryBackend;
@@ -194,17 +195,69 @@ async fn messages_are_dispatched_before_the_event_hook() {
 #[tokio::test]
 async fn a_failed_setup_drops_events_without_panicking() {
     let client = unconnected_client().await;
+    let setups = Arc::new(AtomicU64::new(0));
     // No `Data` is ever produced, so a dispatched command must be dropped, not
     // run against a context whose `data()` would panic.
+    let attempts = Arc::clone(&setups);
     let framework = Framework::builder()
-        .setup(|_client| async move { Err("setup failed".into()) })
+        .setup(move |_client| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            async move { Err("setup failed".into()) }
+        })
         .prefix("!")
         .commands([counted()])
         .build();
 
     framework
+        .dispatch_event(Arc::clone(&client), message_event("!counted"))
+        .await;
+    framework
         .dispatch_event(client, message_event("!counted"))
         .await;
+
+    assert_eq!(
+        setups.load(Ordering::Relaxed),
+        1,
+        "a failed setup must be cached, not retried on every event"
+    );
+}
+
+#[tokio::test]
+async fn a_panicking_setup_is_cached_not_retried() {
+    let client = unconnected_client().await;
+    let attempts = Arc::new(AtomicU64::new(0));
+    let tries = Arc::clone(&attempts);
+    let framework = Framework::builder()
+        .setup(move |_client| {
+            tries.fetch_add(1, Ordering::Relaxed);
+            async move { panic!("the setup panicked") }
+        })
+        .prefix("!")
+        .commands([counted()])
+        .build();
+
+    // Catch the unwind here rather than on a spawned task: `dispatch_event`'s
+    // future is not `Send` enough for `tokio::spawn` to accept it (whatsapp-rust's
+    // async types overflow the compiler's `Send` check), and catching in place is
+    // what proves the panic reaches this caller.
+    let first = std::panic::AssertUnwindSafe(
+        framework.dispatch_event(Arc::clone(&client), message_event("!counted")),
+    )
+    .catch_unwind()
+    .await;
+    assert!(first.is_err(), "a panicking setup must surface as a panic");
+
+    // The panic consumed the setup closure. A later event must not run setup
+    // again and must not panic — it drops the event, leaving the framework quiet
+    // rather than looping on a closure that is already gone.
+    framework
+        .dispatch_event(client, message_event("!counted"))
+        .await;
+    assert_eq!(
+        attempts.load(Ordering::Relaxed),
+        1,
+        "a panicking setup must run once, then be cached as failed"
+    );
 }
 
 #[tokio::test]

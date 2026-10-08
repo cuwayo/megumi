@@ -260,11 +260,11 @@ let bot = Bot::builder()
 ```
 
 The client then drives the framework: it dispatches command messages and runs
-the optional event handler registered with `.event_handler(hook)`. A hook is an
-`async fn(FrameworkContext<Data>, Arc<Event>) -> Result<(), Error>` that sees
-every event the client emits — connects, disconnects, group updates, receipts —
-so non-command behaviour lives with the framework instead of beside it. This
-bot's morning news digest is started from its `Connected` handler.
+the optional event handler registered with `.event_handler(hook)`. A hook is a
+`fn(FrameworkContext<Data>, Arc<Event>) -> BoxFuture<Result<(), Error>>` that
+sees every event the client emits — connects, disconnects, group updates,
+receipts — so non-command behaviour lives with the framework instead of beside
+it. This bot's morning news digest is started from its `Connected` handler.
 
 ## Contributing
 

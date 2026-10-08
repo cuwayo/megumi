@@ -38,15 +38,22 @@ pub fn framework() -> Framework<Data> {
             "news.json".to_string()
         }
     });
+    // Opened here, at build time, so an unreadable store fails the process at
+    // startup rather than on the first message — `setup` runs lazily, so a panic
+    // there would leave the bot alive but unable to answer anything.
+    let news = Arc::new(NewsStore::open(path).unwrap_or_else(|error| panic!("{error}")));
     let started = Instant::now();
 
     Framework::builder()
-        .setup(move |_client| async move {
-            Ok(Data {
-                started,
-                news: Arc::new(NewsStore::open(path).unwrap_or_else(|error| panic!("{error}"))),
-                news_task: tokio::sync::Mutex::new(None),
-            })
+        .setup(move |_client| {
+            let news = Arc::clone(&news);
+            async move {
+                Ok(Data {
+                    started,
+                    news,
+                    news_task: tokio::sync::Mutex::new(None),
+                })
+            }
         })
         .prefix("!")
         .event_handler(news::event_handler)

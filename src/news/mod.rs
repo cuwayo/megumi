@@ -27,34 +27,66 @@ pub use schedule::morning_of;
 /// How often the loop wakes to see whether a morning has started.
 const TICK: Duration = Duration::from_secs(60);
 
-/// Reacts to the client connecting by starting the digest loop.
+/// Reacts to the connection lifecycle by starting or stopping the digest loop.
 ///
 /// This is the framework's [`EventHook`](megumi::EventHook): [`crate::framework`]
 /// registers it with `.event_handler(news::event_handler)` rather than wiring
-/// `BotBuilder::on_connected` by hand. On every `Connected` it stops the
-/// previous connection's loop before starting its replacement, so a reconnect
-/// never leaves two loops running.
+/// `BotBuilder::on_connected` by hand. On `Connected` it stops the previous
+/// connection's loop before starting its replacement, so a reconnect never
+/// leaves two loops running. On `Disconnected` or `LoggedOut` it stops the loop,
+/// so a dropped or unlinked session does not leave a loop ticking against a dead
+/// client (and holding it alive) until the process ends.
+///
+/// A `Connected` delivered late — its handler still waiting on the lock when a
+/// later `Disconnected` has already run — starts nothing: it re-checks the
+/// client's connected flag under the lock, so it cannot resurrect the loop after
+/// the disconnect stopped it.
 pub fn event_handler(
     ctx: FrameworkContext<Data>,
     event: Arc<Event>,
 ) -> BoxFuture<Result<(), Error>> {
     Box::pin(async move {
-        if !matches!(&*event, Event::Connected(_)) {
-            return Ok(());
+        match &*event {
+            Event::Connected(_) => {
+                info!("Connected with WhatsApp");
+                let mut slot = ctx.data.news_task.lock().await;
+                // Re-check under the lock: delivery is concurrent, so this
+                // handler may have been scheduled after a later `Disconnected`
+                // ran. The client clears `is_connected` before dispatching a
+                // disconnect, so a stale `Connected` is rejected here rather
+                // than resurrecting the loop that disconnect just stopped.
+                if !ctx.client.is_connected() {
+                    return Ok(());
+                }
+                stop(&mut slot).await;
+                // Spawned with the slot still locked, and with no `await`
+                // between the spawn and the store, so cancelling this handler
+                // cannot leave the new loop running untracked.
+                *slot = Some(tokio::spawn(run(
+                    ctx.client.clone(),
+                    Arc::clone(&ctx.data.news),
+                )));
+            }
+            Event::Disconnected(_) | Event::LoggedOut(_) => {
+                let mut slot = ctx.data.news_task.lock().await;
+                stop(&mut slot).await;
+            }
+            _ => {}
         }
-        info!("Connected with WhatsApp");
-
-        let mut task = ctx.data.news_task.lock().await;
-        if let Some(previous) = task.take() {
-            previous.abort();
-            let _ = previous.await;
-        }
-        *task = Some(tokio::spawn(run(
-            ctx.client.clone(),
-            Arc::clone(&ctx.data.news),
-        )));
         Ok(())
     })
+}
+
+/// Stops the digest loop in `slot`, aborting it and waiting for it to finish so
+/// a replacement never overlaps it, and leaves the slot empty.
+///
+/// The caller holds the task-slot lock for the whole swap, so two `Connected`
+/// events arriving together cannot both start a loop.
+async fn stop(slot: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(previous) = slot.take() {
+        previous.abort();
+        let _ = previous.await;
+    }
 }
 
 /// Posts the morning digest to every group that asked for it.

@@ -201,7 +201,8 @@ record a trace. Modules:
 window), `queues` (one turn at a time per chat), `gate` (pure trigger decision), `context` (the prompt
 builder and the `ReaderContext`/`Visibility` privacy boundary), `memory` (durable facts: `store` records +
 JSON store, `writer` extraction, `retrieval` ranking), `tools` (the `Tool` trait, `ToolRegistry`, and the
-`WebSearch` tool), `llm` (the `LlmClient` trait, the Anthropic client, and test doubles), `trace`
+`WebSearch` tool), `safety` (the output guard `screen_reply` and the confirmation gate
+`PendingConfirmations`), `llm` (the `LlmClient` trait, the Anthropic client, and test doubles), `trace`
 (replayable turn log), `agent` (`Agent::ingest` and `Agent::respond`).
 
 **Memory (milestone 4)** is wired into `respond`: before the gate it runs `memory::writer::extract_if_due`
@@ -219,6 +220,15 @@ calls, tool results) the Messages API needs, and both the Anthropic `tool_use` a
 shapes parse into it. Tool calls are recorded on the turn's `TurnTrace`. A tool failure is a result handed
 back to the model, never a failed turn, and the extraction pass sends no tools so its request is unchanged.
 
+**The safety layer (milestone 6)** is `safety.rs`. `screen_reply` is the one place a reply becomes
+sendable: it drops an empty/`NO_REPLY` reply, one carrying the prompt's own trust tags, or one reciting the
+system prompt, then truncates to `max_reply_chars`. `Tool::confirmation` returns the question to ask before
+a state-changing tool runs; the agent **holds** such a call, asks the chat, and runs it only in a separate
+turn after the user's "yes" (`PendingConfirmations`, per chat, in memory, expiring after
+`confirmation_ttl`). `run_turn` takes an optional seed so that confirmation turn reuses the same loop, trace,
+and guard. The confirmation answer is resolved *before* `gate::decide`, so a private "ok" is not swallowed
+as an acknowledgement — and in a group only a message directed at the bot (mention or reply) can answer it.
+
 Rules that are easy to break:
 
 - **The agent stores every message in every chat, always** — even when it will not reply. Storage is inline
@@ -230,6 +240,10 @@ Rules that are easy to break:
 - **Privacy is enforced in code, at the query layer, fail-closed.** Every store read takes a `ReaderContext`;
   `Visibility` is matched exhaustively so a new label forces a decision. A private memory never reaches a
   group, and a group memory never crosses to another group.
+- **The output guard and the confirmation gate are code, never model behaviour, and fail closed.** A
+  state-changing tool (one whose `confirmation` is `Some`) is never run on the model's word — it runs in a
+  separate turn after the user's yes, and a held call is per chat and in memory. In a group only a message
+  directed at the bot (mention or reply) can answer a confirmation.
 - **Trigger/identity detection** compares the bot's PN *and* LID with `JidExt::is_same_chat_as`, never
   `is_same_user_as` (which ignores the server and would let a LID match an unrelated phone number), and reads
   `context_info` from whichever base sub-message carries it (a caption can hold a mention).

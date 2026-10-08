@@ -29,6 +29,18 @@ pub trait Tool: Send + Sync {
     /// A failure is a string, not a panic: the agent hands it back to the model
     /// as the call's result so the turn can still answer.
     fn call(&self, arguments: &serde_json::Value) -> BoxFuture<Result<String, String>>;
+
+    /// The question to ask the chat before running this tool, or `None` when it
+    /// is safe to run on the model's word alone.
+    ///
+    /// The default is `None` — a read-only tool needs no confirmation. A tool
+    /// that changes state (sends something, writes somewhere, spends something)
+    /// overrides this to return the question; the agent then holds the call and
+    /// runs it only after the user agrees. The decision is the tool's, not the
+    /// model's, so the model cannot talk its way past it.
+    fn confirmation(&self, _arguments: &serde_json::Value) -> Option<String> {
+        None
+    }
 }
 
 /// The reader-independent tools a turn may call.
@@ -276,6 +288,14 @@ mod tests {
     fn an_empty_result_set_says_so() {
         let response: TavilyResponse = serde_json::from_str(r#"{"results":[]}"#).unwrap();
         assert_eq!(format_results(&response, 4_000), "No results found.");
+    }
+
+    #[test]
+    fn a_read_only_tool_needs_no_confirmation() {
+        // The default is `None`, so an existing tool like `web_search` is
+        // unaffected by the confirmation gate.
+        let tool = WebSearch::new("key", "https://api.tavily.com", 5, 4_000);
+        assert!(tool.confirmation(&serde_json::json!({})).is_none());
     }
 
     #[test]

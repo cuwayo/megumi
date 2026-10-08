@@ -19,7 +19,7 @@ milestone until the earlier one's exit criteria pass.**
 | 3. Context builder, mode profiles, `ReaderContext` + visibility labels | **done** |
 | 4. Semantic memory (writer, retrieval, validity windows) | **done** |
 | 5. Tool loop | **done** (`search_memory`, `web_search`) |
-| 6. Safety layer (output guard, confirmation gates, injection suite) | not started |
+| 6. Safety layer (output guard, confirmation gates, injection suite) | **done** |
 | 7. Commands + rate limits (the deterministic command router) | not started |
 | 8. Planner/evaluator | not started |
 | 9. Consolidation, reflections, tuning | not started |
@@ -33,12 +33,14 @@ milestone until the earlier one's exit criteria pass.**
   store), `writer` (extraction), `retrieval` (ranking behind the privacy filter).
 - `crates/megumi-agent/src/tools.rs` — the `Tool` trait, the `ToolRegistry`, and
   the `WebSearch` tool.
+- `crates/megumi-agent/src/safety.rs` — the output guard, the confirmation gate,
+  and the pending-confirmation store.
 - `src/agent/mod.rs` — the WhatsApp adapter (`InboundMessage` → `InboundEvent`,
   mention/reply/identity detection, sending actions).
 - `src/events.rs` — the single framework `event_handler`, fanning out to the news
   digest and the agent.
-- `crates/megumi-agent/tests/{pipeline,eval,memory,live}.rs` — end-to-end, eval,
-  memory, and live smoke tests.
+- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,live}.rs` —
+  end-to-end, eval, memory, tool-loop, prompt-injection, and live smoke tests.
 
 ## Decisions that must not regress
 
@@ -168,11 +170,51 @@ tool failure is a *result* handed to the model, never a turn failure; and
 the tool cannot leak a fact the prompt would not. The extraction path is
 unchanged: it sends no `tools`, so its request body is byte-identical.
 
-## Milestone 6 — the safety layer (the next one)
+## Milestone 6 — the safety layer (done)
 
-Goal: an output guard, confirmation gates for consequential actions, and the
-prompt-injection suite. The tool loop is where a confirmation gate will attach:
-a tool that changes state should be able to ask before it runs.
+Goal: an output guard, confirmation gates for consequential tool calls, and a
+prompt-injection suite. Built in `crates/megumi-agent/src/safety.rs`, with the
+gate wired into `agent.rs` and `tools.rs`:
+
+- `safety.rs::screen_reply` — the output guard. The single place a model reply
+  becomes sendable: it drops an empty or `NO_REPLY` reply, one carrying the
+  prompt's own trust tags (`<chat_message>`, `<memories>`, …), or one reciting a
+  ≥40-character sentence of the system prompt, and truncates the rest to
+  `max_reply_chars`. The tag and system-prompt checks are the signature of an
+  injection that worked; the guard fails closed.
+- `tools.rs::Tool::confirmation` — a defaulted trait method returning the
+  question to ask before a tool runs, or `None`. A read-only tool
+  (`web_search`, `search_memory`) leaves the default; a state-changing tool
+  overrides it. The decision is the **tool's**, not the model's.
+- `safety.rs::PendingConfirmations` — the held calls, one per chat, in memory
+  (like `ChatQueues`), expiring after `confirmation_ttl`. `classify_confirmation`
+  reads a message as Yes/No/Unrelated from a small fixed word list.
+- `agent.rs` — a consequential call in a tool response is **held, not run**: the
+  question goes to the chat, the call is recorded `(awaiting confirmation)`, and
+  the turn ends. The next message resolves it *before the gate* (a bare "yes"
+  would otherwise be an acknowledgement or a no-trigger), and **only when it is
+  directed at the bot** — a mention or a reply, or any private message — so an
+  unrelated "ok" in a busy group cannot run a state-changing tool. Yes runs the
+  tool and seeds a final narration turn, No replies `Okay, cancelled.`, and any
+  other message leaves the call pending for its TTL. `run_turn` takes an optional
+  seed, so the confirmation path reuses the same loop, trace, and guard with the
+  held call and its result seeded in and no tools advertised.
+- Evals: `tests/injection.rs` (an injected tag is escaped in the prompt and in a
+  memory; a reply reciting the prompt or echoing the tags is dropped; an
+  over-long reply is truncated; an ordinary one passes) and confirmation-gate
+  cases in `tests/tools.rs` (held until confirmed, runs on yes with its result
+  reaching the model, cancelled on no, dropped by an unrelated message, dropped
+  when expired).
+
+**Do not regress:** the guard and the gate are code, never model behaviour, and
+both fail closed. A consequential call is never run on the model's word — it runs
+in a separate turn, only after a directed yes. A held call is per chat and in
+memory, so a restart forgets an unanswered question rather than running a stale
+action. The confirmation answer resolves before `gate::decide`, so a private
+"ok" is not swallowed as an acknowledgement, and in a group only a message
+directed at the bot (mention or reply) can answer it. With no consequential tool
+registered and no pending call, the gate and `NO_REPLY` behaviour are exactly as
+before.
 
 ## Milestone 7 — the command router (note)
 
@@ -187,7 +229,7 @@ call.
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
-2. Read `crates/megumi-agent/src/{lib,agent,context,tools,store}.rs` to see the
-   seams.
+2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,store}.rs` to
+   see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Start milestone 6 (the safety layer) — the next unfinished milestone.
+4. Start milestone 7 (the command router) — the next unfinished milestone.

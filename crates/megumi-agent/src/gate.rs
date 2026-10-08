@@ -18,6 +18,11 @@ pub enum Trigger {
     Reply,
     /// A private-chat message that is not a bare acknowledgement.
     PrivateMessage,
+    /// The message answers a tool confirmation the agent asked for.
+    ///
+    /// Not produced by [`decide`]: it is the reason the agent spoke when it
+    /// resolved a held tool call, so it appears only in a turn's trace.
+    Confirmation,
 }
 
 /// Why the agent stayed silent.

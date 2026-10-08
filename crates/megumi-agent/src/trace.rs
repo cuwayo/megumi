@@ -69,6 +69,7 @@ impl TurnTrace {
             Trigger::Mention => "mention",
             Trigger::Reply => "reply",
             Trigger::PrivateMessage => "private",
+            Trigger::Confirmation => "confirmation",
         }
     }
 }

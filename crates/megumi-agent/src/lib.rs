@@ -24,6 +24,7 @@
 //! - `memory` - durable facts: the store, the extraction writer, and retrieval
 //! - `llm` - the [`LlmClient`] trait, the Anthropic client, and test doubles
 //! - `tools` - the [`Tool`] trait, [`ToolRegistry`], and the web-search tool
+//! - `safety` - the output guard and the confirmation gate for tools
 //! - `trace` - the replayable record of every turn
 //! - `agent` - [`Agent`], which runs the pipeline
 
@@ -37,6 +38,7 @@ pub mod gate;
 pub mod llm;
 pub mod memory;
 pub mod queues;
+pub mod safety;
 pub mod store;
 pub mod tools;
 pub mod trace;
@@ -60,6 +62,7 @@ pub use llm::{
 };
 pub use memory::{MemoryOp, MemoryRecord, MemoryStore};
 pub use queues::ChatQueues;
+pub use safety::{Confirmation, PendingConfirmations, PendingToolCall};
 pub use store::{MessageStore, StoredMessage};
 pub use tools::{Tool, ToolRegistry, WebSearch};
 pub use trace::{ToolCallTrace, TraceSink, TurnTrace};

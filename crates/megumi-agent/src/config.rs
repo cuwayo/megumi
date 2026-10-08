@@ -23,6 +23,16 @@ pub struct AgentConfig {
     pub max_context_tokens: usize,
     /// The most tokens the model may produce in one reply.
     pub max_reply_tokens: u32,
+    /// The most characters of a reply the output guard will send.
+    ///
+    /// A backstop under the token cap: a reply longer than this is truncated
+    /// rather than sent whole.
+    pub max_reply_chars: usize,
+    /// How long a held tool confirmation stays answerable.
+    ///
+    /// A "yes" arriving after this long no longer matches the question, so the
+    /// call is dropped rather than run.
+    pub confirmation_ttl: Duration,
     /// The model id to call.
     pub model: String,
     /// The base URL of the Messages API.
@@ -69,6 +79,8 @@ impl Default for AgentConfig {
             private_window: 40,
             max_context_tokens: 6_000,
             max_reply_tokens: 1_024,
+            max_reply_chars: 4_000,
+            confirmation_ttl: Duration::from_secs(300),
             model: "claude-sonnet-5-5".to_string(),
             api_base: "https://api.anthropic.com".to_string(),
             session_gap: Duration::from_secs(6 * 60 * 60),
@@ -105,6 +117,10 @@ impl AgentConfig {
             max_reply_tokens: env_usize("AGENT_MAX_REPLY_TOKENS")
                 .map(|tokens| tokens as u32)
                 .unwrap_or(default.max_reply_tokens),
+            max_reply_chars: env_usize("AGENT_MAX_REPLY_CHARS").unwrap_or(default.max_reply_chars),
+            confirmation_ttl: env_usize("AGENT_CONFIRMATION_TTL")
+                .map(|secs| Duration::from_secs(secs as u64))
+                .unwrap_or(default.confirmation_ttl),
             model: std::env::var("ANTHROPIC_MODEL").unwrap_or(default.model),
             // `ANTHROPIC_BASE_URL` is what Claude Code and most tooling set;
             // `ANTHROPIC_API_BASE` is kept as an alias.

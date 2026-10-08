@@ -20,15 +20,22 @@ use crate::llm::{
 };
 use crate::memory::{MemoryStore, retrieval, writer};
 use crate::queues::ChatQueues;
+use crate::safety::{self, Confirmation, PendingConfirmations, PendingToolCall};
 use crate::store::{MessageStore, StoredMessage};
 use crate::tools::ToolRegistry;
 use crate::trace::{self, ToolCallTrace, TraceSink, TurnTrace};
 
-/// The literal reply a model uses to decline to speak.
-const NO_REPLY: &str = "NO_REPLY";
-
 /// The name of the per-turn memory-search tool.
 const SEARCH_MEMORY: &str = "search_memory";
+
+/// The reply a code path sends when the user declines a held tool call.
+const CANCELLED: &str = "Okay, cancelled.";
+
+/// The line appended after a tool's confirmation question.
+const CONFIRM_HINT: &str = "Reply \"yes\" to confirm.";
+
+/// The result recorded in the trace for a call held for confirmation.
+const AWAITING_CONFIRMATION: &str = "(awaiting confirmation)";
 
 /// The agent: the store it reads and writes, the model it asks, and the queues
 /// that keep a chat's turns in order.
@@ -40,6 +47,10 @@ pub struct Agent {
     tools: Arc<ToolRegistry>,
     config: AgentConfig,
     queues: ChatQueues,
+    /// The state-changing tool calls held for a user's confirmation, one per
+    /// chat. In memory and per chat, so a restart forgets an unanswered
+    /// question rather than running a stale action.
+    confirmations: PendingConfirmations,
 }
 
 impl Agent {
@@ -61,6 +72,7 @@ impl Agent {
             tools,
             config,
             queues: ChatQueues::new(),
+            confirmations: PendingConfirmations::new(),
         }
     }
 
@@ -113,19 +125,65 @@ impl Agent {
             warn!(chat = %event.chat, %error, "the memory extraction pass failed");
         }
 
+        // A reply to a tool confirmation is resolved before the gate: a bare
+        // "yes" would otherwise be an acknowledgement in a private chat or a
+        // no-trigger in a group. In a group the answer must be directed at the
+        // bot — a mention or a reply, like any other group trigger — so an
+        // unrelated "ok" in a busy group cannot run a state-changing tool. A
+        // message that is not a clear yes or no leaves the held call pending
+        // for its TTL to expire.
+        let directed =
+            event.chat_type == ChatType::Private || event.mentions_self || event.is_reply_to_self;
+        if !event.from_self && !event.is_command && directed {
+            let answer = safety::classify_confirmation(event.trimmed_text());
+            let pending = match answer {
+                Confirmation::Unrelated => None,
+                _ => self.confirmations.take(
+                    &event.chat,
+                    chrono::Utc::now(),
+                    self.config.confirmation_ttl,
+                ),
+            };
+            match (answer, pending) {
+                (Confirmation::Yes, Some(pending)) => {
+                    return self.confirm_turn(event, pending).await;
+                }
+                (Confirmation::No, Some(_)) => {
+                    return Ok(Some(OutboundAction::SendText {
+                        chat: event.chat.clone(),
+                        text: CANCELLED.to_string(),
+                    }));
+                }
+                _ => {}
+            }
+        }
+
         match gate::decide(event) {
             GateDecision::StaySilent(reason) => {
                 debug!(chat = %event.chat, ?reason, "the agent stayed silent");
                 Ok(None)
             }
-            GateDecision::Respond(trigger) => self.run_turn(event, trigger).await,
+            GateDecision::Respond(trigger) => {
+                self.run_turn(event, trigger, Vec::new(), Vec::new(), true)
+                    .await
+            }
         }
     }
 
+    /// Runs a turn, optionally seeded with a transcript a tool result already
+    /// produced.
+    ///
+    /// An ordinary turn passes no seed and advertises tools; the confirmation
+    /// path seeds the run with the held call and its result and advertises no
+    /// tools, so the model just narrates what happened. One function keeps one
+    /// copy of the prompt-building, loop, trace, and guard.
     async fn run_turn(
         &self,
         event: &InboundEvent,
         trigger: Trigger,
+        seed_messages: Vec<LlmMessage>,
+        seed_calls: Vec<ToolCallTrace>,
+        allow_tools: bool,
     ) -> Result<Option<OutboundAction>, crate::Error> {
         let reader = self.reader_for(event);
         let window = match event.chat_type {
@@ -153,15 +211,21 @@ impl Agent {
         );
 
         // The tools the model may call this turn: the reader-bound memory
-        // search, then the registry's reader-independent tools.
-        let tools = self.turn_tools();
+        // search, then the registry's reader-independent tools. A seeded turn
+        // advertises none — it only narrates a result already in hand.
+        let tools = if allow_tools {
+            self.turn_tools()
+        } else {
+            Vec::new()
+        };
 
         let started = Instant::now();
         let mut messages = vec![LlmMessage::Text {
             assistant: false,
             text: prompt.user.clone(),
         }];
-        let mut calls: Vec<ToolCallTrace> = Vec::new();
+        messages.extend(seed_messages);
+        let mut calls = seed_calls;
         // Summed over the turn's calls, staying `None` until a call reports a
         // count — the same answer a single call gave before the loop existed.
         let mut input_tokens: Option<u32> = None;
@@ -172,7 +236,11 @@ impl Agent {
         // The last iteration is a final chance to answer, so it advertises no
         // tools — a call there would have no turn left to use its result.
         let mut reply = None;
-        let max_iterations = self.config.max_tool_iterations;
+        let max_iterations = if allow_tools {
+            self.config.max_tool_iterations
+        } else {
+            0
+        };
         for iteration in 0..=max_iterations {
             let last = iteration == max_iterations;
             let request = LlmRequest {
@@ -204,6 +272,34 @@ impl Agent {
                 break;
             }
 
+            // A state-changing tool is never run on the model's word. Hold the
+            // first such call, ask the chat, and end the turn — the call runs
+            // only when the user confirms. No call in this response runs, so a
+            // confirmed action is never half-applied alongside an unconfirmed
+            // one.
+            if let Some((call, question)) = response
+                .tool_calls
+                .iter()
+                .find_map(|call| self.confirmation_for(call).map(|question| (call, question)))
+            {
+                self.confirmations.put(
+                    &event.chat,
+                    PendingToolCall {
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        call_id: call.id.clone(),
+                        created: chrono::Utc::now(),
+                    },
+                );
+                calls.push(ToolCallTrace {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: AWAITING_CONFIRMATION.to_string(),
+                });
+                reply = Some(format!("{question}\n\n{CONFIRM_HINT}"));
+                break;
+            }
+
             // The model asked for tools. Run each, record it, and feed the
             // results back as the next turn's input.
             let results = self
@@ -214,12 +310,19 @@ impl Agent {
         }
         let latency = started.elapsed();
 
-        let final_reply = reply.filter(|text| {
-            // `NO_REPLY` is the model declining to speak; an empty reply says the
-            // same thing.
-            let trimmed = text.trim();
-            !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(NO_REPLY)
-        });
+        // The output guard is the one place a reply becomes sendable: it drops a
+        // `NO_REPLY`, an empty reply, one carrying the prompt's own tags, or one
+        // reciting the system prompt, and truncates the rest.
+        let final_reply = match reply {
+            Some(text) => {
+                let screened = safety::screen_reply(&text, &prompt.system, &self.config);
+                if screened.is_none() {
+                    debug!(chat = %event.chat, "the output guard suppressed the reply");
+                }
+                screened
+            }
+            None => None,
+        };
         self.traces.record(TurnTrace {
             turn_id: uuid::Uuid::new_v4().to_string(),
             chat: event.chat.clone(),
@@ -240,6 +343,62 @@ impl Agent {
             chat: event.chat.clone(),
             text,
         }))
+    }
+
+    /// Runs a held tool call the user has confirmed, then a final turn that
+    /// narrates the result.
+    ///
+    /// The tool runs here, after the "yes", never before: holding the call and
+    /// running it in this separate turn is what makes the confirmation real
+    /// rather than advisory.
+    async fn confirm_turn(
+        &self,
+        event: &InboundEvent,
+        pending: PendingToolCall,
+    ) -> Result<Option<OutboundAction>, crate::Error> {
+        let arguments: serde_json::Value =
+            serde_json::from_str(&pending.arguments).unwrap_or(serde_json::json!({}));
+        let result = match self.tools.get(&pending.name) {
+            Some(tool) => tool.call(&arguments).await,
+            None => Err(format!("no tool named `{}`", pending.name)),
+        };
+        let content = match result {
+            Ok(content) => content,
+            Err(error) => format!("the tool failed: {error}"),
+        };
+        let call = LlmToolCall {
+            id: pending.call_id.clone(),
+            name: pending.name.clone(),
+            arguments: pending.arguments.clone(),
+        };
+        let recorded = ToolCallTrace {
+            name: pending.name.clone(),
+            arguments: pending.arguments.clone(),
+            result: content.clone(),
+        };
+        let seed = vec![
+            LlmMessage::ToolCalls(vec![call]),
+            LlmMessage::ToolResults(vec![LlmToolResult {
+                id: pending.call_id.clone(),
+                content,
+            }]),
+        ];
+        self.run_turn(event, Trigger::Confirmation, seed, vec![recorded], false)
+            .await
+    }
+
+    /// The confirmation question a tool call needs, or `None` when it may run.
+    ///
+    /// `search_memory` is never consequential — it only reads — so it is not in
+    /// the registry and needs no check. Any other call is looked up and asked.
+    fn confirmation_for(&self, call: &LlmToolCall) -> Option<String> {
+        if call.name == SEARCH_MEMORY {
+            return None;
+        }
+        let tool = self.tools.get(&call.name)?;
+        let arguments: serde_json::Value =
+            serde_json::from_str(&call.arguments).unwrap_or(serde_json::json!({}));
+        tool.confirmation(&arguments)
     }
 
     /// The tools a turn may call: the reader-bound memory search first, then

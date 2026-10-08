@@ -8,6 +8,7 @@
 //! unit-tested in the module).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use megumi_agent::{
     Agent, AgentConfig, ChatId, ChatType, InboundEvent, LlmMessage, LlmResponse, LlmToolCall,
@@ -301,4 +302,230 @@ async fn tools_off_is_a_single_call_as_before() {
             text: requests[0].user.clone(),
         }
     );
+}
+
+/// A state-changing tool that records whether it ever ran.
+///
+/// It overrides [`Tool::confirmation`], so the agent must hold the call and run
+/// it only after a "yes" — the flag is how a test proves it did not run early.
+struct ConsequentialTool {
+    ran: Arc<AtomicBool>,
+}
+
+impl Tool for ConsequentialTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "change_state".into(),
+            description: "changes something".into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    fn call(
+        &self,
+        _arguments: &serde_json::Value,
+    ) -> megumi_agent::llm::BoxFuture<Result<String, String>> {
+        self.ran.store(true, Ordering::SeqCst);
+        Box::pin(async { Ok("the state was changed".to_string()) })
+    }
+
+    fn confirmation(&self, _arguments: &serde_json::Value) -> Option<String> {
+        Some("Change the state?".to_string())
+    }
+}
+
+/// A scripted reply that calls `change_state`.
+fn state_call() -> LlmResponse {
+    LlmResponse {
+        tool_calls: vec![LlmToolCall {
+            id: "call_1".into(),
+            name: "change_state".into(),
+            arguments: "{}".into(),
+        }],
+        ..Default::default()
+    }
+}
+
+/// An agent with the consequential tool registered, over `ran`.
+fn consequential_agent(ran: &Arc<AtomicBool>) -> (Agent, Arc<ScriptedLlm>) {
+    agent(
+        vec![state_call(), text_reply("Done, I changed it.")],
+        vec![Arc::new(ConsequentialTool {
+            ran: Arc::clone(ran),
+        })],
+        3,
+    )
+}
+
+#[tokio::test]
+async fn a_consequential_call_is_held_until_confirmed() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let (agent, _llm) = consequential_agent(&ran);
+    let trigger = event("gA", ChatType::Group, "u1", "@bot change the state");
+    agent.ingest(&trigger).unwrap();
+    let action = agent.respond(&trigger).await.unwrap();
+
+    // The tool did not run; the chat got the question instead.
+    assert!(!ran.load(Ordering::SeqCst), "the tool ran without a yes");
+    let Some(megumi_agent::OutboundAction::SendText { text, .. }) = action else {
+        panic!("expected the confirmation question");
+    };
+    assert!(text.contains("Change the state?"), "{text}");
+    assert!(text.contains("yes"), "{text}");
+
+    // The held call is recorded as awaiting confirmation.
+    let trace = agent.traces().recent(1).unwrap().pop().unwrap();
+    assert_eq!(trace.tool_calls.len(), 1);
+    assert_eq!(trace.tool_calls[0].name, "change_state");
+    assert!(trace.tool_calls[0].result.contains("awaiting confirmation"));
+}
+
+#[tokio::test]
+async fn a_confirmed_call_runs_and_its_result_reaches_the_model() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let (agent, llm) = consequential_agent(&ran);
+
+    let trigger = event("gA", ChatType::Group, "u1", "@bot change the state");
+    agent.ingest(&trigger).unwrap();
+    agent.respond(&trigger).await.unwrap();
+
+    // The user agrees. The confirmation is answered in any chat type, so this
+    // bare "yes" is not read as an acknowledgement or a no-trigger.
+    let yes = event("gA", ChatType::Group, "u1", "yes");
+    agent.ingest(&yes).unwrap();
+    let action = agent.respond(&yes).await.unwrap();
+
+    assert!(ran.load(Ordering::SeqCst), "the confirmed tool must run");
+    assert!(matches!(
+        action,
+        Some(megumi_agent::OutboundAction::SendText { .. })
+    ));
+
+    // The second turn is a confirmation turn, and the tool's result was fed to
+    // the model so it could narrate what happened.
+    let traces = agent.traces().recent(10).unwrap();
+    assert_eq!(traces.len(), 2);
+    assert_eq!(traces[1].trigger, "confirmation");
+    assert_eq!(traces[1].tool_calls.len(), 1);
+    assert!(
+        traces[1].tool_calls[0]
+            .result
+            .contains("the state was changed")
+    );
+    let shown = llm.requests().pop().unwrap().messages;
+    assert!(
+        format!("{shown:?}").contains("the state was changed"),
+        "{shown:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_declined_call_is_cancelled_and_never_runs() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let (agent, _llm) = consequential_agent(&ran);
+    let trigger = event("gA", ChatType::Group, "u1", "@bot change the state");
+    agent.ingest(&trigger).unwrap();
+    agent.respond(&trigger).await.unwrap();
+
+    let no = event("gA", ChatType::Group, "u1", "no");
+    agent.ingest(&no).unwrap();
+    let action = agent.respond(&no).await.unwrap();
+
+    assert!(!ran.load(Ordering::SeqCst), "a declined tool must not run");
+    assert_eq!(
+        action,
+        Some(megumi_agent::OutboundAction::SendText {
+            chat: ChatId::new("gA"),
+            text: "Okay, cancelled.".into(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_unrelated_message_leaves_the_pending_call() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let (agent, _llm) = consequential_agent(&ran);
+    let trigger = event("gA", ChatType::Group, "u1", "@bot change the state");
+    agent.ingest(&trigger).unwrap();
+    agent.respond(&trigger).await.unwrap();
+
+    // A different, triggering message is not a yes or a no, so the held call
+    // stays pending rather than being cancelled by unrelated chatter.
+    let other = event("gA", ChatType::Group, "u1", "@bot what is the time?");
+    agent.ingest(&other).unwrap();
+    agent.respond(&other).await.unwrap();
+    assert!(!ran.load(Ordering::SeqCst));
+
+    // A later directed "yes" still finds it and runs the tool. The event helper
+    // already marks the message as mentioning the bot.
+    let yes = event("gA", ChatType::Group, "u1", "yes");
+    agent.ingest(&yes).unwrap();
+    agent.respond(&yes).await.unwrap();
+    assert!(ran.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn an_undirected_group_yes_does_not_confirm() {
+    // A bare "ok" in a group that does not mention or reply to the bot must not
+    // run a state-changing tool: only a directed answer confirms.
+    let ran = Arc::new(AtomicBool::new(false));
+    let (agent, _llm) = consequential_agent(&ran);
+    let trigger = event("gA", ChatType::Group, "u1", "@bot change the state");
+    agent.ingest(&trigger).unwrap();
+    agent.respond(&trigger).await.unwrap();
+
+    let mut chatter = event("gA", ChatType::Group, "u2", "ok");
+    chatter.mentions_self = false;
+    agent.ingest(&chatter).unwrap();
+    assert!(agent.respond(&chatter).await.unwrap().is_none());
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "an undirected ok must not run it"
+    );
+
+    // The held call survives, so a directed "yes" still confirms it.
+    let yes = event("gA", ChatType::Group, "u1", "yes");
+    agent.ingest(&yes).unwrap();
+    agent.respond(&yes).await.unwrap();
+    assert!(ran.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn an_expired_pending_call_is_not_run() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let llm = Arc::new(ScriptedLlm::new(vec![state_call(), text_reply("narrated")]));
+    let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
+    let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
+    let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
+    let mut config = AgentConfig::for_test();
+    config.max_tool_iterations = 3;
+    // A zero TTL makes any pending call stale the moment it is looked at.
+    config.confirmation_ttl = std::time::Duration::ZERO;
+    let agent = Agent::new(
+        store,
+        memory,
+        traces,
+        llm,
+        Arc::new(ToolRegistry::new(vec![Arc::new(ConsequentialTool {
+            ran: Arc::clone(&ran),
+        })])),
+        config,
+    );
+
+    let trigger = event("gA", ChatType::Group, "u1", "@bot change the state");
+    agent.ingest(&trigger).unwrap();
+    agent.respond(&trigger).await.unwrap();
+
+    let yes = event("gA", ChatType::Group, "u1", "yes");
+    agent.ingest(&yes).unwrap();
+    agent.respond(&yes).await.unwrap();
+
+    // The stale confirmation was dropped, so the tool never ran. The "yes"
+    // falls through to the ordinary gate — here it mentions the bot, so it is an
+    // ordinary mention turn, never a confirmation turn.
+    assert!(!ran.load(Ordering::SeqCst));
+    let traces = agent.traces().recent(10).unwrap();
+    assert_eq!(traces.len(), 2);
+    assert_eq!(traces[1].trigger, "mention");
+    assert!(traces[1].tool_calls.is_empty());
 }

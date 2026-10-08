@@ -12,17 +12,23 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::config::AgentConfig;
-use crate::context::{ContextBuilder, ReaderContext};
+use crate::context::{ContextBuilder, ReaderContext, render_memory};
 use crate::event::{ChatType, InboundEvent, OutboundAction};
 use crate::gate::{self, GateDecision, Trigger};
-use crate::llm::{LlmClient, LlmError, LlmRequest};
+use crate::llm::{
+    LlmClient, LlmError, LlmMessage, LlmRequest, LlmToolCall, LlmToolResult, ToolSpec,
+};
 use crate::memory::{MemoryStore, retrieval, writer};
 use crate::queues::ChatQueues;
 use crate::store::{MessageStore, StoredMessage};
-use crate::trace::{self, TraceSink, TurnTrace};
+use crate::tools::ToolRegistry;
+use crate::trace::{self, ToolCallTrace, TraceSink, TurnTrace};
 
 /// The literal reply a model uses to decline to speak.
 const NO_REPLY: &str = "NO_REPLY";
+
+/// The name of the per-turn memory-search tool.
+const SEARCH_MEMORY: &str = "search_memory";
 
 /// The agent: the store it reads and writes, the model it asks, and the queues
 /// that keep a chat's turns in order.
@@ -31,17 +37,20 @@ pub struct Agent {
     memory: Arc<MemoryStore>,
     traces: Arc<TraceSink>,
     llm: Arc<dyn LlmClient>,
+    tools: Arc<ToolRegistry>,
     config: AgentConfig,
     queues: ChatQueues,
 }
 
 impl Agent {
-    /// Builds an agent over an existing store, memory, trace log, and model.
+    /// Builds an agent over an existing store, memory, trace log, model, and
+    /// tool registry.
     pub fn new(
         store: Arc<MessageStore>,
         memory: Arc<MemoryStore>,
         traces: Arc<TraceSink>,
         llm: Arc<dyn LlmClient>,
+        tools: Arc<ToolRegistry>,
         config: AgentConfig,
     ) -> Self {
         Self {
@@ -49,6 +58,7 @@ impl Agent {
             memory,
             traces,
             llm,
+            tools,
             config,
             queues: ChatQueues::new(),
         }
@@ -142,27 +152,67 @@ impl Agent {
             event,
         );
 
-        let request =
-            LlmRequest::from_prompt(&prompt, &self.config.model, self.config.max_reply_tokens);
-        let started = Instant::now();
-        let response = self.llm.complete(request).await;
-        let latency = started.elapsed();
+        // The tools the model may call this turn: the reader-bound memory
+        // search, then the registry's reader-independent tools.
+        let tools = self.turn_tools();
 
-        let (reply, input_tokens, output_tokens) = match &response {
-            Ok(response) => (
-                Some(response.text.clone()),
-                response.input_tokens,
-                response.output_tokens,
-            ),
-            Err(LlmError::Disabled) => {
-                debug!(chat = %event.chat, "no model is configured; not replying");
-                (None, None, None)
+        let started = Instant::now();
+        let mut messages = vec![LlmMessage::Text {
+            assistant: false,
+            text: prompt.user.clone(),
+        }];
+        let mut calls: Vec<ToolCallTrace> = Vec::new();
+        // Summed over the turn's calls, staying `None` until a call reports a
+        // count — the same answer a single call gave before the loop existed.
+        let mut input_tokens: Option<u32> = None;
+        let mut output_tokens: Option<u32> = None;
+
+        // The loop is bounded: the model normally answers in one call, and a
+        // model that keeps calling tools is cut off rather than looped forever.
+        // The last iteration is a final chance to answer, so it advertises no
+        // tools — a call there would have no turn left to use its result.
+        let mut reply = None;
+        let max_iterations = self.config.max_tool_iterations;
+        for iteration in 0..=max_iterations {
+            let last = iteration == max_iterations;
+            let request = LlmRequest {
+                model: self.config.model.clone(),
+                system: prompt.system.clone(),
+                user: prompt.user.clone(),
+                max_tokens: self.config.max_reply_tokens,
+                tools: if last { Vec::new() } else { tools.clone() },
+                messages: messages.clone(),
+            };
+            let response = match self.llm.complete(request).await {
+                Ok(response) => response,
+                Err(LlmError::Disabled) => {
+                    debug!(chat = %event.chat, "no model is configured; not replying");
+                    break;
+                }
+                Err(error) => {
+                    warn!(chat = %event.chat, %error, "the agent turn failed");
+                    break;
+                }
+            };
+            input_tokens = add_tokens(input_tokens, response.input_tokens);
+            output_tokens = add_tokens(output_tokens, response.output_tokens);
+
+            // The last iteration answers with what it has; there is no turn left
+            // to use a tool result, so any call it still makes is not run.
+            if last || response.tool_calls.is_empty() {
+                reply = Some(response.text);
+                break;
             }
-            Err(error) => {
-                warn!(chat = %event.chat, %error, "the agent turn failed");
-                (None, None, None)
-            }
-        };
+
+            // The model asked for tools. Run each, record it, and feed the
+            // results back as the next turn's input.
+            let results = self
+                .run_tool_calls(&reader, &response.tool_calls, &mut calls)
+                .await;
+            messages.push(LlmMessage::ToolCalls(response.tool_calls));
+            messages.push(LlmMessage::ToolResults(results));
+        }
+        let latency = started.elapsed();
 
         let final_reply = reply.filter(|text| {
             // `NO_REPLY` is the model declining to speak; an empty reply says the
@@ -181,6 +231,7 @@ impl Agent {
             input_tokens,
             output_tokens,
             latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+            tool_calls: calls,
             reply: final_reply.clone(),
             timestamp: chrono::Utc::now(),
         })?;
@@ -189,6 +240,83 @@ impl Agent {
             chat: event.chat.clone(),
             text,
         }))
+    }
+
+    /// The tools a turn may call: the reader-bound memory search first, then
+    /// the registry's.
+    fn turn_tools(&self) -> Vec<ToolSpec> {
+        let mut tools = Vec::new();
+        if self.config.max_tool_iterations > 0 {
+            tools.push(memory_tool_spec());
+            tools.extend(self.tools.specs());
+        }
+        tools
+    }
+
+    /// Runs every tool call `calls` asked for, recording each and returning the
+    /// results to hand back to the model.
+    ///
+    /// A tool that fails returns a short error string as its result rather than
+    /// failing the turn, so the model can still answer around it.
+    async fn run_tool_calls(
+        &self,
+        reader: &ReaderContext,
+        calls: &[LlmToolCall],
+        recorded: &mut Vec<ToolCallTrace>,
+    ) -> Vec<LlmToolResult> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&call.arguments).unwrap_or(serde_json::json!({}));
+            let result = if call.name == SEARCH_MEMORY {
+                self.search_memory(reader, &arguments)
+            } else if let Some(tool) = self.tools.get(&call.name) {
+                tool.call(&arguments).await
+            } else {
+                Err(format!("no tool named `{}`", call.name))
+            };
+            let content = match result {
+                Ok(content) => content,
+                Err(error) => format!("the tool failed: {error}"),
+            };
+            recorded.push(ToolCallTrace {
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                result: content.clone(),
+            });
+            results.push(LlmToolResult {
+                id: call.id.clone(),
+                content,
+            });
+        }
+        results
+    }
+
+    /// The `search_memory` tool: the facts `reader` may see for a query.
+    fn search_memory(
+        &self,
+        reader: &ReaderContext,
+        arguments: &serde_json::Value,
+    ) -> Result<String, String> {
+        let query = arguments
+            .get("query")
+            .and_then(|query| query.as_str())
+            .ok_or_else(|| "search_memory needs a `query` argument".to_string())?;
+        let memories = retrieval::search(
+            reader,
+            query,
+            &self.memory,
+            &self.config,
+            chrono::Utc::now(),
+        )?;
+        if memories.is_empty() {
+            return Ok("No stored facts matched.".to_string());
+        }
+        Ok(memories
+            .iter()
+            .map(render_memory)
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     /// The message store, for tests and diagnostics.
@@ -226,6 +354,42 @@ impl Agent {
     }
 }
 
+/// Adds a call's token count to the turn's running total.
+///
+/// A count stays `None` until some call reports one, so a provider that reports
+/// no usage yields `None` rather than a misleading `0`.
+fn add_tokens(total: Option<u32>, reported: Option<u32>) -> Option<u32> {
+    match (total, reported) {
+        (Some(total), Some(reported)) => Some(total + reported),
+        (Some(total), None) => Some(total),
+        (None, reported) => reported,
+    }
+}
+
+/// The spec of the per-turn `search_memory` tool.
+///
+/// The tool is not in the registry because its result depends on the turn's
+/// reader, which the registry does not have; the spec itself is reader-free.
+fn memory_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: SEARCH_MEMORY.to_string(),
+        description: "Search the facts this conversation has stored about people, places, \
+                      plans, and preferences. Use it when the answer may depend on something \
+                      said earlier that is no longer in the recent messages."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What to look up in memory."
+                }
+            },
+            "required": ["query"]
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,12 +403,20 @@ mod tests {
                 text: text.to_string(),
                 input_tokens: Some(1),
                 output_tokens: Some(1),
+                ..Default::default()
             }
         })));
         let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
         let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
         let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
-        let agent = Agent::new(store, memory, traces, llm.clone(), AgentConfig::for_test());
+        let agent = Agent::new(
+            store,
+            memory,
+            traces,
+            llm.clone(),
+            Arc::new(ToolRegistry::new(Vec::new())),
+            AgentConfig::for_test(),
+        );
         (agent, llm)
     }
 

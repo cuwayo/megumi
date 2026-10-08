@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::{DateTime, Duration, Utc};
 use megumi_agent::{
     Agent, AgentConfig, ChatId, ChatType, InboundEvent, LlmResponse, MemoryStore, MessageStore,
-    OutboundAction, ScriptedLlm, SenderId, TraceSink,
+    OutboundAction, ScriptedLlm, SenderId, ToolRegistry, TraceSink,
 };
 
 /// Builds a fully-specified inbound event.
@@ -103,12 +103,20 @@ impl Harness {
                 text: text.to_string(),
                 input_tokens: Some(10),
                 output_tokens: Some(4),
+                ..Default::default()
             }
         })));
         let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
         let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
         let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
-        let agent = Agent::new(store, memory, traces, llm.clone(), AgentConfig::for_test());
+        let agent = Agent::new(
+            store,
+            memory,
+            traces,
+            llm.clone(),
+            Arc::new(ToolRegistry::new(Vec::new())),
+            AgentConfig::for_test(),
+        );
         Self { agent, llm }
     }
 

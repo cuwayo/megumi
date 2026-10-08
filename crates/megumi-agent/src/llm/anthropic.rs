@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{BoxFuture, LlmClient, LlmError, LlmRequest, LlmResponse};
+use super::{BoxFuture, LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, LlmToolCall};
 
 /// The `anthropic-version` header the Messages API requires.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -92,6 +92,15 @@ struct ContentBlock {
     kind: String,
     #[serde(default)]
     text: String,
+    /// A `tool_use` block's call id, echoed back with the result.
+    #[serde(default)]
+    id: String,
+    /// A `tool_use` block's tool name.
+    #[serde(default)]
+    name: String,
+    /// A `tool_use` block's arguments, as a JSON object.
+    #[serde(default)]
+    input: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +113,24 @@ struct Choice {
 struct ChoiceMessage {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiToolCall>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiToolCall {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    function: Option<OpenAiFunction>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiFunction {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    arguments: String,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +184,54 @@ impl ApiResponse {
             None => (None, None),
         }
     }
+
+    /// The tool calls the model asked for, from whichever shape it used.
+    ///
+    /// Anthropic carries them as `tool_use` content blocks; OpenAI as a
+    /// `tool_calls` array on the choice's message. The arguments are rendered
+    /// back to a JSON string, which is how the agent stores and replays them.
+    fn tool_calls(&self) -> Vec<LlmToolCall> {
+        let anthropic: Vec<LlmToolCall> = self
+            .content
+            .iter()
+            .filter(|block| block.kind == "tool_use")
+            .map(|block| LlmToolCall {
+                id: block.id.clone(),
+                name: block.name.clone(),
+                arguments: block
+                    .input
+                    .as_ref()
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_default(),
+            })
+            .collect();
+        if !anthropic.is_empty() {
+            return anthropic;
+        }
+        self.choices
+            .first()
+            .and_then(|choice| choice.message.as_ref())
+            .map(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|call| LlmToolCall {
+                        id: call.id.clone(),
+                        name: call
+                            .function
+                            .as_ref()
+                            .map(|function| function.name.clone())
+                            .unwrap_or_default(),
+                        arguments: call
+                            .function
+                            .as_ref()
+                            .map(|function| function.arguments.clone())
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl LlmClient for AnthropicLlm {
@@ -177,12 +252,29 @@ async fn send(
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
     let url = messages_url(api_base);
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": request.model,
         "max_tokens": request.max_tokens,
         "system": request.system,
-        "messages": [{ "role": "user", "content": request.user }],
+        "messages": messages_body(request),
     });
+    // Sent only when there are tools, so the extraction pass and a plain turn
+    // emit exactly the body they emitted before the tool loop existed.
+    if !request.tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
+                    })
+                })
+                .collect(),
+        );
+    }
 
     let mut attempt = 0;
     loop {
@@ -218,6 +310,7 @@ async fn send(
                 text: strip_safety_artifacts(&parsed.reply_text()),
                 input_tokens,
                 output_tokens,
+                tool_calls: parsed.tool_calls(),
             });
         }
 
@@ -235,6 +328,58 @@ async fn send(
             body: body_text.chars().take(500).collect(),
         });
     }
+}
+
+/// The request's `messages` array, from whichever shape the request carries.
+///
+/// An empty transcript is the single-call shape every pre-tool caller uses: one
+/// user turn, the request's `user`. A tool loop fills the transcript instead,
+/// and each entry is rendered as the block shape the Messages API expects.
+fn messages_body(request: &LlmRequest) -> Vec<serde_json::Value> {
+    if request.messages.is_empty() {
+        return vec![serde_json::json!({ "role": "user", "content": request.user })];
+    }
+    request
+        .messages
+        .iter()
+        .map(|message| match message {
+            LlmMessage::Text { assistant, text } => serde_json::json!({
+                "role": if *assistant { "assistant" } else { "user" },
+                "content": text,
+            }),
+            LlmMessage::ToolCalls(calls) => {
+                let content: Vec<serde_json::Value> = calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            // The model usually emits an object, but a malformed
+                            // or empty string becomes `{}` rather than failing
+                            // the request, so the tool reports its own error.
+                            "input": serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "role": "assistant", "content": content })
+            }
+            LlmMessage::ToolResults(results) => {
+                let content: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|result| {
+                        serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": result.id,
+                            "content": result.content,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "role": "user", "content": content })
+            }
+        })
+        .collect()
 }
 
 /// The Messages endpoint for `api_base`.
@@ -278,6 +423,7 @@ fn strip_safety_artifacts(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::LlmToolResult;
     use super::*;
 
     #[test]
@@ -330,6 +476,91 @@ mod tests {
         let parsed: ApiResponse = serde_json::from_str(body).unwrap();
         let error = parsed.error.unwrap();
         assert_eq!(error.message, "no credentials");
+    }
+
+    #[test]
+    fn an_anthropic_tool_use_block_is_parsed() {
+        let body = r#"{"content":[
+            {"type":"text","text":"Let me look that up."},
+            {"type":"tool_use","id":"call_1","name":"web_search","input":{"query":"weather"}}
+        ],"stop_reason":"tool_use"}"#;
+        let parsed: ApiResponse = serde_json::from_str(body).unwrap();
+        let calls = parsed.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments, r#"{"query":"weather"}"#);
+        assert_eq!(parsed.reply_text(), "Let me look that up.");
+    }
+
+    #[test]
+    fn an_openai_tool_calls_reply_is_parsed() {
+        let body = r#"{"choices":[{"finish_reason":"tool_calls","message":{
+            "role":"assistant","content":null,
+            "tool_calls":[{"id":"call_2","type":"function",
+                "function":{"name":"web_search","arguments":"{\"query\":\"news\"}"}}]
+        }}]}"#;
+        let parsed: ApiResponse = serde_json::from_str(body).unwrap();
+        let calls = parsed.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments, r#"{"query":"news"}"#);
+    }
+
+    #[test]
+    fn a_plain_reply_has_no_tool_calls() {
+        let body = r#"{"content":[{"type":"text","text":"hello"}]}"#;
+        let parsed: ApiResponse = serde_json::from_str(body).unwrap();
+        assert!(parsed.tool_calls().is_empty());
+    }
+
+    #[test]
+    fn a_transcript_is_rendered_as_the_messages_array() {
+        let request = LlmRequest {
+            model: "m".into(),
+            system: "s".into(),
+            user: "first".into(),
+            max_tokens: 10,
+            tools: Vec::new(),
+            messages: vec![
+                LlmMessage::Text {
+                    assistant: false,
+                    text: "first".into(),
+                },
+                LlmMessage::ToolCalls(vec![LlmToolCall {
+                    id: "c1".into(),
+                    name: "web_search".into(),
+                    arguments: r#"{"query":"x"}"#.into(),
+                }]),
+                LlmMessage::ToolResults(vec![LlmToolResult {
+                    id: "c1".into(),
+                    content: "a result".into(),
+                }]),
+            ],
+        };
+        let body = messages_body(&request);
+        assert_eq!(body.len(), 3);
+        assert_eq!(body[0]["role"], "user");
+        assert_eq!(body[1]["content"][0]["type"], "tool_use");
+        assert_eq!(body[1]["content"][0]["input"]["query"], "x");
+        assert_eq!(body[2]["content"][0]["type"], "tool_result");
+        assert_eq!(body[2]["content"][0]["tool_use_id"], "c1");
+    }
+
+    #[test]
+    fn an_empty_transcript_is_the_single_user_turn() {
+        let request = LlmRequest::from_prompt(
+            &crate::context::Prompt {
+                system: "s".into(),
+                user: "u".into(),
+            },
+            "m",
+            10,
+        );
+        let body = messages_body(&request);
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0]["role"], "user");
+        assert_eq!(body[0]["content"], "u");
     }
 
     #[test]

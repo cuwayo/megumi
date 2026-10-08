@@ -48,6 +48,18 @@ pub struct AgentConfig {
     pub memory_extract_max_memories: usize,
     /// How many memories a turn recalls into the prompt.
     pub memory_recall_top: usize,
+    /// How many times the model may call tools before the loop stops.
+    ///
+    /// A bound, not a target: the model normally answers in one call, and a
+    /// model that keeps calling tools is cut off here rather than looping. Zero
+    /// disables tools entirely.
+    pub max_tool_iterations: usize,
+    /// How many results a web search asks for.
+    pub web_search_results: usize,
+    /// The most characters of web-search results handed back to the model.
+    pub web_search_max_chars: usize,
+    /// The base URL of the web-search API.
+    pub web_search_base: String,
 }
 
 impl Default for AgentConfig {
@@ -69,6 +81,10 @@ impl Default for AgentConfig {
             memory_extract_tokens: 1_024,
             memory_extract_max_memories: 50,
             memory_recall_top: 8,
+            max_tool_iterations: 3,
+            web_search_results: 5,
+            web_search_max_chars: 4_000,
+            web_search_base: "https://api.tavily.com".to_string(),
         }
     }
 }
@@ -118,6 +134,13 @@ impl AgentConfig {
                 .unwrap_or(default.memory_extract_max_memories),
             memory_recall_top: env_usize("AGENT_MEMORY_RECALL_TOP")
                 .unwrap_or(default.memory_recall_top),
+            max_tool_iterations: env_usize("AGENT_MAX_TOOL_ITERATIONS")
+                .unwrap_or(default.max_tool_iterations),
+            web_search_results: env_usize("AGENT_WEB_SEARCH_RESULTS")
+                .unwrap_or(default.web_search_results),
+            web_search_max_chars: env_usize("AGENT_WEB_SEARCH_MAX_CHARS")
+                .unwrap_or(default.web_search_max_chars),
+            web_search_base: std::env::var("TAVILY_API_BASE").unwrap_or(default.web_search_base),
         }
     }
 
@@ -126,12 +149,14 @@ impl AgentConfig {
     /// Memory extraction is switched off — the batch threshold is unreachable
     /// and the idle gap is forever — so a test that is not about memory never
     /// spends a scripted model reply on an extraction pass. A memory test lowers
-    /// the threshold itself.
+    /// the threshold itself. Tools are off too, so a test that is not about the
+    /// tool loop never sees one; a tool test raises the bound itself.
     pub fn for_test() -> Self {
         Self {
             store_dir: PathBuf::from(":memory:"),
             memory_extract_batch: usize::MAX,
             memory_extract_idle: Duration::MAX,
+            max_tool_iterations: 0,
             ..Self::default()
         }
     }

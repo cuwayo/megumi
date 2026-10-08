@@ -16,6 +16,17 @@ use serde::{Deserialize, Serialize};
 use crate::event::ChatId;
 use crate::gate::Trigger;
 
+/// One tool call a turn made, as recorded for replay.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallTrace {
+    /// The tool that was called.
+    pub name: String,
+    /// The arguments the model produced, as its raw JSON string.
+    pub arguments: String,
+    /// What the tool returned, or the error it reported.
+    pub result: String,
+}
+
 /// One turn, as recorded for replay.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnTrace {
@@ -33,12 +44,18 @@ pub struct TurnTrace {
     pub system_chars: usize,
     /// The size of the user turn, in characters.
     pub user_chars: usize,
-    /// Input tokens the model reported.
+    /// Input tokens the model reported, summed over the turn's calls.
     pub input_tokens: Option<u32>,
-    /// Output tokens the model reported.
+    /// Output tokens the model reported, summed over the turn's calls.
     pub output_tokens: Option<u32>,
     /// How long the model call took.
     pub latency_ms: u64,
+    /// The tools the model called this turn, in order.
+    ///
+    /// Defaulted so a trace log written before the tool loop existed still
+    /// loads.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallTrace>,
     /// The reply the agent decided on, or `None` when it stayed silent.
     pub reply: Option<String>,
     /// When the turn finished.
@@ -180,6 +197,7 @@ mod tests {
             input_tokens: Some(5),
             output_tokens: Some(3),
             latency_ms: 100,
+            tool_calls: Vec::new(),
             reply: Some("hi".into()),
             timestamp: Utc::now(),
         }

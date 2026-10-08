@@ -195,12 +195,14 @@ to every event kind, not just `Messages`; the agent guards on `event.as_messages
 `crates/megumi-agent` is a **platform-agnostic** agent core (lib name `megumi_agent`); it never imports
 `whatsapp-rust`. `src/agent/` is the only place that knows both, converting `whatsapp_rust` messages into
 `megumi_agent::InboundEvent`s and sending the `OutboundAction`s back. The pipeline is: store every message →
-gate (whether to speak) → build a budgeted, trust-tagged prompt → call the model → record a trace. Modules:
+gate (whether to speak) → build a budgeted, trust-tagged prompt → call the model, running any tool calls →
+record a trace. Modules:
 `event` (types), `config` (`AgentConfig`), `store` (per-chat JSON history, one file per chat, bounded
 window), `queues` (one turn at a time per chat), `gate` (pure trigger decision), `context` (the prompt
 builder and the `ReaderContext`/`Visibility` privacy boundary), `memory` (durable facts: `store` records +
-JSON store, `writer` extraction, `retrieval` ranking), `llm` (the `LlmClient` trait, the Anthropic
-client, and test doubles), `trace` (replayable turn log), `agent` (`Agent::ingest` and `Agent::respond`).
+JSON store, `writer` extraction, `retrieval` ranking), `tools` (the `Tool` trait, `ToolRegistry`, and the
+`WebSearch` tool), `llm` (the `LlmClient` trait, the Anthropic client, and test doubles), `trace`
+(replayable turn log), `agent` (`Agent::ingest` and `Agent::respond`).
 
 **Memory (milestone 4)** is wired into `respond`: before the gate it runs `memory::writer::extract_if_due`
 (one model call when a chat has ≥25 new messages or a 10-minute idle backlog, under the per-chat lock), and
@@ -208,6 +210,14 @@ client, and test doubles), `trace` (replayable turn log), `agent` (`Agent::inges
 `visibility` and `valid_from` are set in code, never by the model, and retrieval filters by
 `ReaderContext` before ranking. v1 similarity is lexical (the provider has no embeddings endpoint). See
 `docs/AGENT.md` for the decisions that must not regress.
+
+**The tool loop (milestone 5)** is `run_turn`: it calls the model with `search_memory` (built per turn from
+the reader, so it filters through `retrieval::search`) plus the registry's reader-independent tools
+(`web_search`, present only with `TAVILY_API_KEY`), runs any calls, appends the results, and repeats up to
+`max_tool_iterations` — the last iteration only answers. `LlmMessage` is the three-shape turn (text, tool
+calls, tool results) the Messages API needs, and both the Anthropic `tool_use` and OpenAI `tool_calls`
+shapes parse into it. Tool calls are recorded on the turn's `TurnTrace`. A tool failure is a result handed
+back to the model, never a failed turn, and the extraction pass sends no tools so its request is unchanged.
 
 Rules that are easy to break:
 
@@ -233,10 +243,12 @@ it does), authenticated by `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Beare
 as a fallback and both headers always sent so the real API also works), with `ANTHROPIC_MODEL` (default
 `claude-sonnet-5-5`) selecting the model. The request is the Anthropic Messages shape, but the response
 parser accepts both the Anthropic (`content` blocks) and OpenAI (`choices`) shapes, because a gateway may
-answer the Anthropic route in the OpenAI shape. Without a credential the agent still stores messages but
-never replies (`DisabledLlm`). The crate's own tests drive the whole pipeline with a `ScriptedLlm`, so they
-need no network; the three reasoning evals in `crates/megumi-agent/tests/eval.rs` are `#[ignore]`d pending a
-live model.
+answer the Anthropic route in the OpenAI shape; both `tool_use` and `tool_calls` parse the same way. Web
+search goes over raw HTTP too, against `TAVILY_API_BASE` (default `https://api.tavily.com`) with
+`TAVILY_API_KEY` as a bearer token. Without a credential the agent still stores messages but never replies
+(`DisabledLlm`). The crate's own tests drive the whole pipeline with a `ScriptedLlm`, so they need no
+network; the three reasoning evals in `crates/megumi-agent/tests/eval.rs` are `#[ignore]`d pending a live
+model.
 
 ## Adding a command
 

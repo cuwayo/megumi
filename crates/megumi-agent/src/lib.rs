@@ -23,6 +23,7 @@
 //!   [`ReaderContext`]/[`Visibility`] privacy boundary
 //! - `memory` - durable facts: the store, the extraction writer, and retrieval
 //! - `llm` - the [`LlmClient`] trait, the Anthropic client, and test doubles
+//! - `tools` - the [`Tool`] trait, [`ToolRegistry`], and the web-search tool
 //! - `trace` - the replayable record of every turn
 //! - `agent` - [`Agent`], which runs the pipeline
 
@@ -37,6 +38,7 @@ pub mod llm;
 pub mod memory;
 pub mod queues;
 pub mod store;
+pub mod tools;
 pub mod trace;
 
 /// The crate's error type, the same boxed shape the framework uses.
@@ -53,9 +55,11 @@ pub use event::{
 };
 pub use gate::{GateDecision, Trigger};
 pub use llm::{
-    AnthropicLlm, DisabledLlm, LlmClient, LlmError, LlmRequest, LlmResponse, ScriptedLlm,
+    AnthropicLlm, DisabledLlm, LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse,
+    LlmToolCall, LlmToolResult, ScriptedLlm, ToolSpec,
 };
 pub use memory::{MemoryOp, MemoryRecord, MemoryStore};
 pub use queues::ChatQueues;
 pub use store::{MessageStore, StoredMessage};
-pub use trace::{TraceSink, TurnTrace};
+pub use tools::{Tool, ToolRegistry, WebSearch};
+pub use trace::{ToolCallTrace, TraceSink, TurnTrace};

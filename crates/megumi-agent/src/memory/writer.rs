@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::config::AgentConfig;
-use crate::context::{Visibility, escape};
+use crate::context::{Visibility, escape, truncate};
 use crate::event::{ChatId, ChatType, SenderId};
 use crate::llm::{LlmClient, LlmError, LlmRequest};
 use crate::memory::store::{MemoryOp, MemoryRecord, MemoryStore, NewFact};
@@ -67,6 +67,8 @@ pub async fn extract_if_due(
         system,
         user,
         max_tokens: config.memory_extract_tokens,
+        tools: Vec::new(),
+        messages: Vec::new(),
     };
 
     let response = match llm.complete(request).await {
@@ -327,14 +329,6 @@ fn earliest_evidence(
     earliest
 }
 
-/// Cuts `text` to `max_chars` characters, never splitting one.
-fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    text.chars().take(max_chars).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,8 +351,7 @@ mod tests {
     fn scripted(text: &str) -> ScriptedLlm {
         ScriptedLlm::new([crate::llm::LlmResponse {
             text: text.into(),
-            input_tokens: None,
-            output_tokens: None,
+            ..Default::default()
         }])
     }
 

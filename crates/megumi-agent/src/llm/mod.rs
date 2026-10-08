@@ -28,9 +28,22 @@ pub struct LlmRequest {
     /// The stable system prompt.
     pub system: String,
     /// The volatile user turn.
+    ///
+    /// Kept alongside [`messages`](Self::messages) because it is the first user
+    /// turn and the single-call paths — extraction, and a turn with no tools —
+    /// send it on its own. A tool loop sends `messages` instead, whose first
+    /// entry is this same text.
     pub user: String,
     /// The cap on reply tokens.
     pub max_tokens: u32,
+    /// The tools the model may call, empty when it may call none.
+    pub tools: Vec<ToolSpec>,
+    /// The full conversation to send, in order.
+    ///
+    /// Empty means "just [`user`](Self::user)" — the single-call shape every
+    /// pre-tool caller uses. A tool loop fills this so the model sees its own
+    /// tool calls and their results.
+    pub messages: Vec<LlmMessage>,
 }
 
 impl LlmRequest {
@@ -41,12 +54,66 @@ impl LlmRequest {
             system: prompt.system.clone(),
             user: prompt.user.clone(),
             max_tokens,
+            tools: Vec::new(),
+            messages: Vec::new(),
         }
     }
 }
 
-/// One reply from the model.
+/// One turn of the conversation sent to the model.
+///
+/// A turn is one of the three shapes the Messages API distinguishes: text, the
+/// tool calls the assistant made, or the results answering them. Flattening a
+/// tool call to text would not round-trip — the API needs the `tool_use` and
+/// `tool_result` blocks paired by id.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LlmMessage {
+    /// A text turn; `assistant` is true when the model said it.
+    Text {
+        /// Whether the model, rather than the user, produced this turn.
+        assistant: bool,
+        /// The turn's text.
+        text: String,
+    },
+    /// The assistant asked to call these tools.
+    ToolCalls(Vec<LlmToolCall>),
+    /// The results answering the preceding tool calls.
+    ToolResults(Vec<LlmToolResult>),
+}
+
+/// A tool the model may call, as advertised in the request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolSpec {
+    /// The name the model calls it by.
+    pub name: String,
+    /// What the tool does, so the model knows when to call it.
+    pub description: String,
+    /// The JSON Schema of the tool's arguments.
+    pub parameters: serde_json::Value,
+}
+
+/// A tool call the model asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmToolCall {
+    /// The provider's id for this call, echoed back with its result.
+    pub id: String,
+    /// The tool to call.
+    pub name: String,
+    /// The call's arguments, as the raw JSON string the model produced.
+    pub arguments: String,
+}
+
+/// The result of one tool call, sent back to the model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmToolResult {
+    /// The id of the call this answers.
+    pub id: String,
+    /// The tool's output, or a short message saying why it failed.
+    pub content: String,
+}
+
+/// One reply from the model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LlmResponse {
     /// The reply text, before the agent strips a `NO_REPLY`.
     pub text: String,
@@ -54,6 +121,8 @@ pub struct LlmResponse {
     pub input_tokens: Option<u32>,
     /// Output tokens the model reported, when it reported any.
     pub output_tokens: Option<u32>,
+    /// The tools the model asked to call, empty when it answered directly.
+    pub tool_calls: Vec<LlmToolCall>,
 }
 
 /// Why a model call failed.

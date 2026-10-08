@@ -34,6 +34,7 @@ impl ScriptedLlm {
                 text,
                 input_tokens: None,
                 output_tokens: None,
+                tool_calls: Vec::new(),
             },
             1024,
         ))

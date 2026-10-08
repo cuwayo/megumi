@@ -180,16 +180,7 @@ impl<'a> ContextBuilder<'a> {
         if !visible.is_empty() {
             body.push_str("<memories>\n");
             for memory in &visible {
-                body.push_str("- ");
-                // A superseded fact is only recalled for a question about the
-                // past; the window it held is named so the model does not read
-                // it as current.
-                if let Some(until) = memory.valid_to {
-                    body.push_str("(no longer true as of ");
-                    body.push_str(&until.date_naive().to_string());
-                    body.push_str(") ");
-                }
-                body.push_str(&escape(&memory.content));
+                body.push_str(&render_memory(memory));
                 body.push('\n');
             }
             body.push_str("</memories>\n\n");
@@ -285,6 +276,23 @@ fn system_prompt(chat_type: ChatType, trigger: &InboundEvent) -> String {
     )
 }
 
+/// One recalled fact as a prompt line, with the window it held when superseded.
+///
+/// A superseded fact is only recalled for a question about the past; the window
+/// it held is named so the model does not read it as current. Shared with the
+/// `search_memory` tool so a fact reads the same whether it arrives in the
+/// prompt or through a tool call.
+pub(crate) fn render_memory(memory: &RecalledMemory) -> String {
+    let mut line = String::from("- ");
+    if let Some(until) = memory.valid_to {
+        line.push_str("(no longer true as of ");
+        line.push_str(&until.date_naive().to_string());
+        line.push_str(") ");
+    }
+    line.push_str(&escape(&memory.content));
+    line
+}
+
 /// One stored message as a trust-tagged line.
 fn render_message(message: &StoredMessage) -> String {
     let who = if message.from_self {
@@ -314,6 +322,17 @@ pub(crate) fn escape(text: &str) -> String {
         }
     }
     out
+}
+
+/// Cuts `text` to `max_chars` characters, never splitting one.
+///
+/// Shared with the memory writer and the web-search tool, which both cap a
+/// model-facing string rather than drop it.
+pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
 }
 
 /// A cheap token estimate: about four characters per token.

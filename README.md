@@ -27,7 +27,8 @@ group administration, and it ships with a reusable command framework modelled on
 - **An AI agent** — mention it in a group, or message it directly, and it
   answers with the conversation as context. It reads every message to keep that
   context, remembers each chat separately, and never carries one chat's private
-  content into another. Needs `ANTHROPIC_API_KEY`.
+  content into another. It can search its memory of the chat, and the web with
+  `TAVILY_API_KEY`. Needs `ANTHROPIC_API_KEY`.
 
 ## Requirements
 
@@ -148,6 +149,11 @@ group's content is never used in another. The agent is honest that it is an AI,
 and a reply it cannot help with is simply a short answer rather than an
 invention.
 
+A reply may look something up before it is written. The agent can search its own
+memory of the chat, and — when `TAVILY_API_KEY` is set — the web. It runs at most
+a few lookups per turn before it must answer, and every lookup is recorded in the
+turn log.
+
 Without the key the agent still runs and stores each chat's history, it just
 never replies; a warning says so at startup. History and a replayable log of
 every turn live under `AGENT_DIR` (default `agent/`, gitignored).
@@ -181,6 +187,11 @@ optional; without the file the bot runs with sticker-pack conversion disabled.
 | `AGENT_STORE_WINDOW` | `200` | Messages kept per chat |
 | `AGENT_TRACE_CAPACITY` | `500` | Turns kept in the trace log |
 | `AGENT_SESSION_GAP` | `21600` | Seconds before a private pause counts as a new session |
+| `AGENT_MAX_TOOL_ITERATIONS` | `3` | Tool calls a turn may make before it must answer; `0` disables tools |
+| `TAVILY_API_KEY` | unset | Enables the agent's `web_search` tool |
+| `TAVILY_API_BASE` | `https://api.tavily.com` | Web-search API base; override for a proxy |
+| `AGENT_WEB_SEARCH_RESULTS` | `5` | Results a web search asks for |
+| `AGENT_WEB_SEARCH_MAX_CHARS` | `4000` | Characters of web-search results handed to the model |
 
 ## Development
 

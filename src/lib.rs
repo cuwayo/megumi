@@ -105,5 +105,19 @@ fn build_agent() -> Arc<megumi_agent::Agent> {
             }
         };
 
-    Arc::new(megumi_agent::Agent::new(store, memory, traces, llm, config))
+    // Web search is optional: without `TAVILY_API_KEY` the tool is simply
+    // absent, and `search_memory` is the only tool a turn may call.
+    let mut tools: Vec<Arc<dyn megumi_agent::Tool>> = Vec::new();
+    if let Some(web_search) = megumi_agent::WebSearch::from_env(&config) {
+        tools.push(Arc::new(web_search));
+    }
+
+    Arc::new(megumi_agent::Agent::new(
+        store,
+        memory,
+        traces,
+        llm,
+        Arc::new(megumi_agent::ToolRegistry::new(tools)),
+        config,
+    ))
 }

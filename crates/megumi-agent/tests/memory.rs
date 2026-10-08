@@ -12,7 +12,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use megumi_agent::{
     Agent, AgentConfig, ChatId, ChatType, InboundEvent, LlmResponse, MemoryOp, MemoryStore,
-    MessageStore, ScriptedLlm, SenderId, TraceSink, Visibility,
+    MessageStore, ScriptedLlm, SenderId, ToolRegistry, TraceSink, Visibility,
 };
 
 /// A pipeline over in-memory stores, with memory extraction turned on.
@@ -28,6 +28,7 @@ fn agent(
             text: text.to_string(),
             input_tokens: Some(10),
             output_tokens: Some(4),
+            ..Default::default()
         }
     })));
     let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
@@ -35,7 +36,14 @@ fn agent(
     let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
     let mut config = AgentConfig::for_test();
     config.memory_extract_batch = extract_batch;
-    let agent = Agent::new(store, memory, traces, llm.clone(), config);
+    let agent = Agent::new(
+        store,
+        memory,
+        traces,
+        llm.clone(),
+        Arc::new(ToolRegistry::new(Vec::new())),
+        config,
+    );
     (agent, llm)
 }
 
@@ -196,7 +204,14 @@ async fn a_failed_extraction_pass_does_not_advance_the_cursor() {
     let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
     let mut config = AgentConfig::for_test();
     config.memory_extract_batch = 2;
-    let agent = Agent::new(store, memory, traces, llm, config);
+    let agent = Agent::new(
+        store,
+        memory,
+        traces,
+        llm,
+        Arc::new(ToolRegistry::new(Vec::new())),
+        config,
+    );
 
     for text in ["one", "two"] {
         let e = event("gA", ChatType::Group, "u1", text);

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use megumi_agent::{AgentConfig, MemoryStore, MessageStore, ScriptedLlm, TraceSink};
+use megumi_agent::{AgentConfig, MemoryStore, MessageStore, ScriptedLlm, ToolRegistry, TraceSink};
 use megumi_whatsapp::agent::on_messages;
 use megumi_whatsapp::{Data, NewsStore};
 use whatsapp_rust::bot::Bot;
@@ -31,6 +31,7 @@ fn data() -> Data {
         memory,
         traces,
         llm,
+        Arc::new(ToolRegistry::new(Vec::new())),
         AgentConfig::for_test(),
     ));
     Data {

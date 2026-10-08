@@ -18,7 +18,7 @@ milestone until the earlier one's exit criteria pass.**
 | 2. Tracing + eval harness | **done** (trace log + deterministic evals) |
 | 3. Context builder, mode profiles, `ReaderContext` + visibility labels | **done** |
 | 4. Semantic memory (writer, retrieval, validity windows) | **done** |
-| 5. Tool loop | not started |
+| 5. Tool loop | **done** (`search_memory`, `web_search`) |
 | 6. Safety layer (output guard, confirmation gates, injection suite) | not started |
 | 7. Commands + rate limits (the deterministic command router) | not started |
 | 8. Planner/evaluator | not started |
@@ -31,6 +31,8 @@ milestone until the earlier one's exit criteria pass.**
   `gate`, `context`, `memory/`, `llm/`, `trace`, `agent`.
 - `crates/megumi-agent/src/memory/` — durable facts: `store` (records + the JSON
   store), `writer` (extraction), `retrieval` (ranking behind the privacy filter).
+- `crates/megumi-agent/src/tools.rs` — the `Tool` trait, the `ToolRegistry`, and
+  the `WebSearch` tool.
 - `src/agent/mod.rs` — the WhatsApp adapter (`InboundMessage` → `InboundEvent`,
   mention/reply/identity detection, sending actions).
 - `src/events.rs` — the single framework `event_handler`, fanning out to the news
@@ -131,11 +133,46 @@ from the chat type), and every fact must cite evidence message ids that are in
 the batch, so a model cannot widen a fact's reach or invent a source. Extraction
 runs under the per-chat turn lock, and a failed pass is logged, never fatal.
 
-## Milestone 5 — the tool loop (the next one)
+## Milestone 5 — the tool loop (done)
 
-Goal: let the model call tools mid-turn (a `search_memory` tool over
-`retrieval::search`, web/command tools), with the loop bounded and every call
-traced. Milestone 4's `retrieval::search` is the seam the first tool builds on.
+Goal: let the model call tools mid-turn, with the loop bounded and every call
+traced. Milestone 4's `retrieval::search` is the seam the first tool built on.
+Built in `crates/megumi-agent/src/tools.rs` and `agent.rs`:
+
+- `tools.rs` — the `Tool` trait (`spec` + `call`), `ToolRegistry` (name → tool),
+  and `WebSearch`, which POSTs to Tavily's `/search` and flattens the results.
+  `WebSearch::from_env` returns `None` without `TAVILY_API_KEY`, so an
+  unconfigured bot simply has no web search. The base is `TAVILY_API_BASE`
+  (default `https://api.tavily.com`).
+- `llm/mod.rs` — `LlmRequest` gained `tools` and `messages`; `LlmResponse`
+  gained `tool_calls` and `stop_reason`. `LlmMessage` is the three-shape turn
+  (text, tool calls, tool results) the Messages API needs, so a call and its
+  result round-trip by id. `anthropic.rs` renders them and parses `tool_use`
+  blocks and OpenAI `tool_calls` alike.
+- `agent.rs::run_turn` — a bounded loop: call the model, run any tool calls,
+  append the results, repeat up to `max_tool_iterations`. The last iteration is
+  a final chance to answer; its calls are not run, so a model that keeps calling
+  tools is cut off rather than looped. Tokens are summed over the calls, and the
+  whole loop is one trace.
+- `search_memory` is built **per turn** from the turn's `ReaderContext`, not the
+  registry, because it must filter through `retrieval::search`'s privacy
+  boundary. It is advertised only when `max_tool_iterations > 0`.
+- The `TurnTrace` gained `tool_calls: Vec<ToolCallTrace>` (`#[serde(default)]`,
+  so an old `traces.json` still loads). Evals: `tests/tools.rs` (a call runs and
+  answers, the loop is bounded, a private fact never reaches a group tool result,
+  a failing tool still answers, tools off is a single call).
+
+**Do not regress:** the loop is bounded (a tool-calling model cannot spin); a
+tool failure is a *result* handed to the model, never a turn failure; and
+`search_memory` reads through the same `ReaderContext` filter as the prompt, so
+the tool cannot leak a fact the prompt would not. The extraction path is
+unchanged: it sends no `tools`, so its request body is byte-identical.
+
+## Milestone 6 — the safety layer (the next one)
+
+Goal: an output guard, confirmation gates for consequential actions, and the
+prompt-injection suite. The tool loop is where a confirmation gate will attach:
+a tool that changes state should be able to ask before it runs.
 
 ## Milestone 7 — the command router (note)
 
@@ -150,6 +187,7 @@ call.
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
-2. Read `crates/megumi-agent/src/{lib,agent,context,store}.rs` to see the seams.
+2. Read `crates/megumi-agent/src/{lib,agent,context,tools,store}.rs` to see the
+   seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Start milestone 4 at step 1 above.
+4. Start milestone 6 (the safety layer) — the next unfinished milestone.

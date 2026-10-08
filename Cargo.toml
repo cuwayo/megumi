@@ -12,6 +12,7 @@ tokio = { version = "1.53.1", features = ["full"] }
 tracing = { version = "0.1.44", features = ["async-await", "attributes"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 megumi = { package = "megumi-framework", path = "crates/megumi-framework" }
+megumi-agent = { path = "crates/megumi-agent" }
 reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -27,7 +28,11 @@ dotenvy = "0.15"
 chrono = "0.4.45"
 
 [workspace]
-members = ["crates/megumi-framework", "crates/megumi-framework-macros"]
+members = [
+    "crates/megumi-framework",
+    "crates/megumi-framework-macros",
+    "crates/megumi-agent",
+]
 resolver = "3"
 
 # The vendored webp-animation carries the `EncodingConfig::method` fix that

@@ -24,6 +24,10 @@ group administration, and it ships with a reusable command framework modelled on
 - **A real command layer** — typed arguments, subcommands, permission gates,
   cooldowns, and centralized error handling, instead of a hand-rolled match on
   message text.
+- **An AI agent** — mention it in a group, or message it directly, and it
+  answers with the conversation as context. It reads every message to keep that
+  context, remembers each chat separately, and never carries one chat's private
+  content into another. Needs `ANTHROPIC_API_KEY`.
 
 ## Requirements
 
@@ -128,6 +132,32 @@ bot sends itself — the account you linked — and it is hidden from `!help`.
 Treat the host accordingly: anyone who can send messages from that account can
 run commands on it.
 
+### The AI agent
+
+With `ANTHROPIC_API_KEY` set, the bot also runs a conversational agent. In a
+group it answers only when it is **@mentioned**, when you **reply to one of its
+messages**, or through a command — it still reads and remembers every message,
+so its answers have context, but it stays quiet otherwise. In a **private chat**
+it answers every message, skipping only bare acknowledgements like "ok" or a
+thumbs-up. It never answers a command (the command layer does that) and never
+answers its own echoed messages.
+
+Each chat is remembered separately. What is said in one chat does not appear in
+another: a private conversation's content is never used in a group, and one
+group's content is never used in another. The agent is honest that it is an AI,
+and a reply it cannot help with is simply a short answer rather than an
+invention.
+
+Without the key the agent still runs and stores each chat's history, it just
+never replies; a warning says so at startup. History and a replayable log of
+every turn live under `AGENT_DIR` (default `agent/`, gitignored).
+
+## Configuration
+
+Settings come from a `.env` file in the working directory. Every variable is
+optional; without the file the bot runs with sticker-pack conversion and the AI
+agent disabled.
+
 ## Configuration
 
 Settings come from a `.env` file in the working directory. Every variable is
@@ -140,6 +170,17 @@ optional; without the file the bot runs with sticker-pack conversion disabled.
 | `RUST_LOG` | unset | Tracing filter, e.g. `megumi=info` to see command outcomes |
 | `NEWS_DB` | `news.json` | Where group news subscriptions are stored |
 | `NEWS_HOUR` | `7` | Local hour the morning digest is sent at |
+| `ANTHROPIC_AUTH_TOKEN` | unset | Enables the AI agent; sent as a Bearer token. `ANTHROPIC_API_KEY` is an accepted fallback |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | The model the agent calls |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | The Messages API base; may include `/v1` or not, point it at a gateway to route elsewhere |
+| `AGENT_DIR` | `agent` | Where the agent keeps each chat's history and its turn log |
+| `AGENT_GROUP_WINDOW` | `30` | Recent group messages a turn's context carries |
+| `AGENT_PRIVATE_WINDOW` | `40` | Recent private messages a turn's context carries |
+| `AGENT_MAX_CONTEXT_TOKENS` | `6000` | Ceiling on the assembled context |
+| `AGENT_MAX_REPLY_TOKENS` | `1024` | Most tokens the model may produce per reply |
+| `AGENT_STORE_WINDOW` | `200` | Messages kept per chat |
+| `AGENT_TRACE_CAPACITY` | `500` | Turns kept in the trace log |
+| `AGENT_SESSION_GAP` | `21600` | Seconds before a private pause counts as a new session |
 
 ## Development
 
@@ -149,16 +190,21 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-The workspace has three crates, all edition 2024:
+The workspace has four crates, all edition 2024:
 
 - `crates/megumi-framework` — the command framework. Its library name is
   `megumi`, which is what command code imports.
 - `crates/megumi-framework-macros` — the `#[command]` and `#[group]` proc macros.
-- the repository root — the bot binary (`src/main.rs`) and its commands
-  (`src/commands/<name>/mod.rs`).
+- `crates/megumi-agent` — the AI agent core, platform-agnostic (its library name
+  is `megumi_agent`). It never imports `whatsapp-rust`; the bot's `src/agent/`
+  adapts between them, and the agent's tests drive the whole pipeline with a
+  scripted model, so they need no network.
+- the repository root — the bot binary (`src/main.rs`), its commands
+  (`src/commands/<name>/mod.rs`), and the agent adapter (`src/agent/`).
 
 Tests in `crates/megumi-framework/tests/` exercise the macro expansion directly
-and are the fastest feedback for macro changes. Tests at the repository root
+and are the fastest feedback for macro changes. Tests in `crates/megumi-agent/`
+run the agent end to end against a scripted model. Tests at the repository root
 drive the bot's real command registry, so a new command is covered there once it
 is registered.
 

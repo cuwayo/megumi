@@ -62,14 +62,17 @@ Some sticker tests shell out to `ffmpeg`; they are the slow ones (seconds, not m
 
 ## Workspace layout
 
-Three crates, all `edition = "2024"`, `resolver = "3"`:
+Four crates, all `edition = "2024"`, `resolver = "3"`:
 
 - `crates/megumi-framework-macros` — the `#[command]` / `#[group]` / `#[derive(ChoiceParameter)]` proc macros.
   `command.rs` parses attributes and emits a `RegisteredCommand`; `signature.rs` turns the function signature
   into argument bindings; `choice_parameter.rs` turns an enum's variants into the words it accepts.
 - `crates/megumi-framework` — the library. **Its lib name is `megumi`**, so the bot depends on it as
   `megumi = { package = "megumi-framework", ... }`. Public API is re-exported from `lib.rs`.
-- repo root — the bot binary (`src/main.rs`), its commands (`src/commands/<name>/mod.rs`), and integration tests.
+- `crates/megumi-agent` — the platform-agnostic AI agent core (lib name `megumi_agent`). It has **no
+  `whatsapp-rust` dependency**; the bot's `src/agent/` adapts between the two. See "The AI agent" below.
+- repo root — the bot binary (`src/main.rs`), its commands (`src/commands/<name>/mod.rs`), the agent adapter
+  (`src/agent/`), and integration tests.
 
 The proc macros expand against `::megumi::__private::{RegisteredCommand, GroupDescriptor, ChoicesOf}` and
 `::megumi::{PopArgument, Args, Context, ...}`. Changing a type those paths name means the **macro crate and
@@ -171,10 +174,61 @@ groups commands under. Each group's `context = crate::Context` is how the macro 
   under `sh -c` with a 10 s timeout and replies with the tail of the output.
 
 `Data` (in `src/data.rs`) holds the process start time, pinned in `framework()` so `!uptime` measures the
-whole run, the news subscription store, and the handle to the running digest task. The start time is pinned
-at build time (outside the async `setup` closure) so it still precedes the first command; the rest is built
-inside `setup`. The digest loop is started by `src/news::event_handler`, the framework's `event_handler`,
-on the `Connected` event — `main` no longer wires `on_connected` itself.
+whole run, the news subscription store, the handle to the running digest task, and the AI agent. The start
+time is pinned at build time (outside the async `setup` closure) so it still precedes the first command; the
+agent is also built at build time (so a corrupt store fails startup), while the rest is built inside `setup`.
+The digest loop is started by `src/news::event_handler` on the `Connected` event — `main` no longer wires
+`on_connected` itself.
+
+The framework allows only one `event_handler`, and both the news digest and the agent need one, so
+`src/events.rs::event_handler` is the single hook: it rebuilds the `FrameworkContext` for each consumer (its
+fields are public) and runs the news handler, then the agent. Because a hook is set, the framework subscribes
+to every event kind, not just `Messages`; the agent guards on `event.as_messages()` and ignores the rest.
+
+## The AI agent
+
+> **Continuing the agent work? Read [`docs/AGENT.md`](docs/AGENT.md) first.** It
+> records what is built (milestones 1–3), the decisions that must not regress,
+> and the next milestones in order (milestone 4 is semantic memory). The
+> architecture below is the reference; `docs/AGENT.md` is the state and roadmap.
+
+`crates/megumi-agent` is a **platform-agnostic** agent core (lib name `megumi_agent`); it never imports
+`whatsapp-rust`. `src/agent/` is the only place that knows both, converting `whatsapp_rust` messages into
+`megumi_agent::InboundEvent`s and sending the `OutboundAction`s back. The pipeline is: store every message →
+gate (whether to speak) → build a budgeted, trust-tagged prompt → call the model → record a trace. Modules:
+`event` (types), `config` (`AgentConfig`), `store` (per-chat JSON history, one file per chat, bounded
+window), `queues` (one turn at a time per chat), `gate` (pure trigger decision), `context` (the prompt
+builder and the `ReaderContext`/`Visibility` privacy boundary), `llm` (the `LlmClient` trait, the Anthropic
+client, and test doubles), `trace` (replayable turn log), `agent` (`Agent::ingest` and `Agent::respond`).
+
+Rules that are easy to break:
+
+- **The agent stores every message in every chat, always** — even when it will not reply. Storage is inline
+  and unlocked so a slow turn never delays it; turns are serialized per chat by `ChatQueues`. Ingest runs
+  before `respond` so a redelivered trigger is already stored and is not answered twice.
+- **Groups need an explicit trigger** (mention, reply-to-bot, or command); **private chats answer every real
+  message** except a bare acknowledgement. Commands belong to the command layer, so the agent stays silent on
+  them even when they mention the bot. This is the gate's decision table.
+- **Privacy is enforced in code, at the query layer, fail-closed.** Every store read takes a `ReaderContext`;
+  `Visibility` is matched exhaustively so a new label forces a decision. A private memory never reaches a
+  group, and a group memory never crosses to another group.
+- **Trigger/identity detection** compares the bot's PN *and* LID with `JidExt::is_same_chat_as`, never
+  `is_same_user_as` (which ignores the server and would let a LID match an unrelated phone number), and reads
+  `context_info` from whichever base sub-message carries it (a caption can hold a mention).
+- **Do not combine the inline agent turn with `EventDelivery::Ordered`** — the default `Concurrent` spawns
+  each event on its own task, but `Ordered` drains through one task and would head-of-line-block every event
+  (and drop events once its mailbox fills).
+
+The model is called over raw HTTP (no Rust SDK) against `ANTHROPIC_BASE_URL` (default
+`https://api.anthropic.com`; a gateway URL may or may not include `/v1` — only `/messages` is appended when
+it does), authenticated by `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Bearer`, with `ANTHROPIC_API_KEY`
+as a fallback and both headers always sent so the real API also works), with `ANTHROPIC_MODEL` (default
+`claude-sonnet-5-5`) selecting the model. The request is the Anthropic Messages shape, but the response
+parser accepts both the Anthropic (`content` blocks) and OpenAI (`choices`) shapes, because a gateway may
+answer the Anthropic route in the OpenAI shape. Without a credential the agent still stores messages but
+never replies (`DisabledLlm`). The crate's own tests drive the whole pipeline with a `ScriptedLlm`, so they
+need no network; the three reasoning evals in `crates/megumi-agent/tests/eval.rs` are `#[ignore]`d pending a
+live model.
 
 ## Adding a command
 

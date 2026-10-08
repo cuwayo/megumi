@@ -22,4 +22,9 @@ pub struct Data {
     /// every reconnect, and the loop runs forever, so without this each
     /// reconnect would leave another loop running beside the new one.
     pub news_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The AI agent: its message store, trace log, model client, and per-chat
+    /// queues. Built at framework-build time so a corrupt store fails startup
+    /// rather than the first message; the agent never needs the connected
+    /// client, only the adapter does.
+    pub agent: Arc<megumi_agent::Agent>,
 }

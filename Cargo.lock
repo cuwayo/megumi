@@ -1834,6 +1834,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "megumi-agent"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "megumi-framework"
 version = "0.1.0"
 dependencies = [
@@ -1864,6 +1877,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "image",
+ "megumi-agent",
  "megumi-framework",
  "qrcode",
  "rand 0.10.3",

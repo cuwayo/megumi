@@ -8,8 +8,10 @@ use std::time::Instant;
 
 use megumi::Framework;
 
+pub mod agent;
 pub mod commands;
 mod data;
+pub mod events;
 pub mod news;
 
 pub use data::Data;
@@ -43,20 +45,23 @@ pub fn framework() -> Framework<Data> {
     // there would leave the bot alive but unable to answer anything.
     let news = Arc::new(NewsStore::open(path).unwrap_or_else(|error| panic!("{error}")));
     let started = Instant::now();
+    let agent = build_agent();
 
     Framework::builder()
         .setup(move |_client| {
             let news = Arc::clone(&news);
+            let agent = Arc::clone(&agent);
             async move {
                 Ok(Data {
                     started,
                     news,
                     news_task: tokio::sync::Mutex::new(None),
+                    agent,
                 })
             }
         })
         .prefix("!")
-        .event_handler(news::event_handler)
+        .event_handler(events::event_handler)
         .groups([
             commands::utility(),
             commands::media(),
@@ -64,4 +69,36 @@ pub fn framework() -> Framework<Data> {
             commands::owner(),
         ])
         .build()
+}
+
+/// Builds the agent and everything it owns, at framework-build time.
+///
+/// The message store and trace log are opened here, so a corrupt file fails
+/// startup. The model is optional: without `ANTHROPIC_API_KEY` the agent still
+/// stores every message but cannot reply, and that is a warning, not an error.
+fn build_agent() -> Arc<megumi_agent::Agent> {
+    let config = megumi_agent::AgentConfig::from_env();
+
+    let store = Arc::new(
+        megumi_agent::MessageStore::open(config.chats_dir(), config.max_stored_messages)
+            .unwrap_or_else(|error| panic!("{error}")),
+    );
+    let traces = Arc::new(
+        megumi_agent::TraceSink::open(config.trace_path(), config.trace_capacity)
+            .unwrap_or_else(|error| panic!("{error}")),
+    );
+
+    let llm: Arc<dyn megumi_agent::LlmClient> =
+        match megumi_agent::AnthropicLlm::from_env(&config.api_base) {
+            Some(llm) => Arc::new(llm),
+            None => {
+                tracing::warn!(
+                    "no ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY is set; the agent will store \
+                     messages but not reply"
+                );
+                Arc::new(megumi_agent::DisabledLlm)
+            }
+        };
+
+    Arc::new(megumi_agent::Agent::new(store, traces, llm, config))
 }

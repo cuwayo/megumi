@@ -73,14 +73,19 @@ pub fn framework() -> Framework<Data> {
 
 /// Builds the agent and everything it owns, at framework-build time.
 ///
-/// The message store and trace log are opened here, so a corrupt file fails
-/// startup. The model is optional: without `ANTHROPIC_API_KEY` the agent still
-/// stores every message but cannot reply, and that is a warning, not an error.
+/// The message store, the memory store, and the trace log are opened here, so a
+/// corrupt file fails startup. The model is optional: without
+/// `ANTHROPIC_API_KEY` the agent still stores every message but cannot reply,
+/// and that is a warning, not an error.
 fn build_agent() -> Arc<megumi_agent::Agent> {
     let config = megumi_agent::AgentConfig::from_env();
 
     let store = Arc::new(
         megumi_agent::MessageStore::open(config.chats_dir(), config.max_stored_messages)
+            .unwrap_or_else(|error| panic!("{error}")),
+    );
+    let memory = Arc::new(
+        megumi_agent::MemoryStore::open(config.memory_path())
             .unwrap_or_else(|error| panic!("{error}")),
     );
     let traces = Arc::new(
@@ -100,5 +105,5 @@ fn build_agent() -> Arc<megumi_agent::Agent> {
             }
         };
 
-    Arc::new(megumi_agent::Agent::new(store, traces, llm, config))
+    Arc::new(megumi_agent::Agent::new(store, memory, traces, llm, config))
 }

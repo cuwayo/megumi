@@ -21,6 +21,7 @@
 //! - `gate` - the pure decision of whether a message is answered
 //! - `context` - the layered, token-budgeted prompt builder, and the
 //!   [`ReaderContext`]/[`Visibility`] privacy boundary
+//! - `memory` - durable facts: the store, the extraction writer, and retrieval
 //! - `llm` - the [`LlmClient`] trait, the Anthropic client, and test doubles
 //! - `trace` - the replayable record of every turn
 //! - `agent` - [`Agent`], which runs the pipeline
@@ -33,6 +34,7 @@ pub mod context;
 pub mod event;
 pub mod gate;
 pub mod llm;
+pub mod memory;
 pub mod queues;
 pub mod store;
 pub mod trace;
@@ -53,6 +55,7 @@ pub use gate::{GateDecision, Trigger};
 pub use llm::{
     AnthropicLlm, DisabledLlm, LlmClient, LlmError, LlmRequest, LlmResponse, ScriptedLlm,
 };
+pub use memory::{MemoryOp, MemoryRecord, MemoryStore};
 pub use queues::ChatQueues;
 pub use store::{MessageStore, StoredMessage};
 pub use trace::{TraceSink, TurnTrace};

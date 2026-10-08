@@ -36,6 +36,18 @@ pub struct AgentConfig {
     pub trace_capacity: usize,
     /// Where the per-chat message files live, or `":memory:"` for none.
     pub store_dir: PathBuf,
+    /// How many unprocessed messages trigger a memory extraction pass.
+    pub memory_extract_batch: usize,
+    /// How long a chat may sit with an unprocessed backlog before a pass.
+    pub memory_extract_idle: Duration,
+    /// The most messages one extraction pass reads.
+    pub memory_extract_max_messages: usize,
+    /// The most tokens an extraction reply may use.
+    pub memory_extract_tokens: u32,
+    /// The most existing facts an extraction prompt shows for targeting.
+    pub memory_extract_max_memories: usize,
+    /// How many memories a turn recalls into the prompt.
+    pub memory_recall_top: usize,
 }
 
 impl Default for AgentConfig {
@@ -51,6 +63,12 @@ impl Default for AgentConfig {
             max_stored_messages: 200,
             trace_capacity: 500,
             store_dir: PathBuf::from("agent"),
+            memory_extract_batch: 25,
+            memory_extract_idle: Duration::from_secs(10 * 60),
+            memory_extract_max_messages: 50,
+            memory_extract_tokens: 1_024,
+            memory_extract_max_memories: 50,
+            memory_recall_top: 8,
         }
     }
 }
@@ -86,13 +104,34 @@ impl AgentConfig {
             store_dir: std::env::var("AGENT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or(default.store_dir),
+            memory_extract_batch: env_usize("AGENT_MEMORY_EXTRACT_BATCH")
+                .unwrap_or(default.memory_extract_batch),
+            memory_extract_idle: env_usize("AGENT_MEMORY_EXTRACT_IDLE")
+                .map(|secs| Duration::from_secs(secs as u64))
+                .unwrap_or(default.memory_extract_idle),
+            memory_extract_max_messages: env_usize("AGENT_MEMORY_EXTRACT_MAX_MESSAGES")
+                .unwrap_or(default.memory_extract_max_messages),
+            memory_extract_tokens: env_usize("AGENT_MEMORY_EXTRACT_TOKENS")
+                .map(|tokens| tokens as u32)
+                .unwrap_or(default.memory_extract_tokens),
+            memory_extract_max_memories: env_usize("AGENT_MEMORY_EXTRACT_MAX_MEMORIES")
+                .unwrap_or(default.memory_extract_max_memories),
+            memory_recall_top: env_usize("AGENT_MEMORY_RECALL_TOP")
+                .unwrap_or(default.memory_recall_top),
         }
     }
 
     /// A small, in-memory configuration for tests.
+    ///
+    /// Memory extraction is switched off — the batch threshold is unreachable
+    /// and the idle gap is forever — so a test that is not about memory never
+    /// spends a scripted model reply on an extraction pass. A memory test lowers
+    /// the threshold itself.
     pub fn for_test() -> Self {
         Self {
             store_dir: PathBuf::from(":memory:"),
+            memory_extract_batch: usize::MAX,
+            memory_extract_idle: Duration::MAX,
             ..Self::default()
         }
     }
@@ -119,6 +158,19 @@ impl AgentConfig {
             PathBuf::from(":memory:")
         } else {
             self.store_dir.join("traces.json")
+        }
+    }
+
+    /// The path of the memory store.
+    ///
+    /// Beside the chats directory and the trace log, for the same reason: the
+    /// message store reads every file in `chats_dir` as a chat, so nothing else
+    /// may live among them.
+    pub fn memory_path(&self) -> PathBuf {
+        if self.store_dir.as_os_str() == ":memory:" {
+            PathBuf::from(":memory:")
+        } else {
+            self.store_dir.join("memories.json")
         }
     }
 }
@@ -160,5 +212,16 @@ mod tests {
         let config = AgentConfig::default();
         let chats = config.chats_dir();
         assert!(!config.trace_path().starts_with(&chats), "{chats:?}");
+        assert!(!config.memory_path().starts_with(&chats), "{chats:?}");
+    }
+
+    #[test]
+    fn for_test_never_runs_a_memory_pass() {
+        // An unreachable batch and an infinite idle gap keep every non-memory
+        // test from spending a scripted reply on extraction.
+        let config = AgentConfig::for_test();
+        assert_eq!(config.memory_extract_batch, usize::MAX);
+        assert_eq!(config.memory_extract_idle, Duration::MAX);
+        assert_eq!(config.memory_path(), PathBuf::from(":memory:"));
     }
 }

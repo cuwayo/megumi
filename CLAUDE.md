@@ -198,8 +198,16 @@ to every event kind, not just `Messages`; the agent guards on `event.as_messages
 gate (whether to speak) → build a budgeted, trust-tagged prompt → call the model → record a trace. Modules:
 `event` (types), `config` (`AgentConfig`), `store` (per-chat JSON history, one file per chat, bounded
 window), `queues` (one turn at a time per chat), `gate` (pure trigger decision), `context` (the prompt
-builder and the `ReaderContext`/`Visibility` privacy boundary), `llm` (the `LlmClient` trait, the Anthropic
+builder and the `ReaderContext`/`Visibility` privacy boundary), `memory` (durable facts: `store` records +
+JSON store, `writer` extraction, `retrieval` ranking), `llm` (the `LlmClient` trait, the Anthropic
 client, and test doubles), `trace` (replayable turn log), `agent` (`Agent::ingest` and `Agent::respond`).
+
+**Memory (milestone 4)** is wired into `respond`: before the gate it runs `memory::writer::extract_if_due`
+(one model call when a chat has ≥25 new messages or a 10-minute idle backlog, under the per-chat lock), and
+`run_turn` recalls facts via `memory::retrieval::search` instead of passing an empty slice. A fact's
+`visibility` and `valid_from` are set in code, never by the model, and retrieval filters by
+`ReaderContext` before ranking. v1 similarity is lexical (the provider has no embeddings endpoint). See
+`docs/AGENT.md` for the decisions that must not regress.
 
 Rules that are easy to break:
 

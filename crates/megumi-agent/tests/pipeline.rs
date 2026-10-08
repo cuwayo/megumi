@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use megumi_agent::{
-    Agent, AgentConfig, ChatId, ChatType, InboundEvent, LlmResponse, MessageStore, OutboundAction,
-    ScriptedLlm, SenderId, TraceSink,
+    Agent, AgentConfig, ChatId, ChatType, InboundEvent, LlmResponse, MemoryStore, MessageStore,
+    OutboundAction, ScriptedLlm, SenderId, TraceSink,
 };
 
 fn agent(replies: impl IntoIterator<Item = &'static str>) -> (Agent, Arc<ScriptedLlm>) {
@@ -24,8 +24,9 @@ fn agent(replies: impl IntoIterator<Item = &'static str>) -> (Agent, Arc<Scripte
         }
     })));
     let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
+    let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
     let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
-    let agent = Agent::new(store, traces, llm.clone(), AgentConfig::for_test());
+    let agent = Agent::new(store, memory, traces, llm.clone(), AgentConfig::for_test());
     (agent, llm)
 }
 

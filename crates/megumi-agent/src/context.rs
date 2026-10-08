@@ -12,6 +12,8 @@
 //! code, exhaustively, so a new label cannot be silently permissive. Every read
 //! takes a `ReaderContext`; there is no path that queries memories without one.
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::AgentConfig;
 use crate::event::{ChatId, ChatType, InboundEvent, SenderId};
 use crate::store::StoredMessage;
@@ -39,7 +41,12 @@ pub struct ReaderContext {
 /// The label is set when the memory is written and is immutable except by its
 /// owner. It is the whole of the private-to-group boundary: a group read filters
 /// `Private` memories out at the query layer, so they never reach the model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The serde representation is externally tagged with no `other` fallback: a
+/// stored label the code does not know is an error, not a silently visible
+/// default, so a corrupt memory file fails at startup the way a corrupt message
+/// file does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Visibility {
     /// Only the owner, only in their private chat. The default for anything
     /// learned in a private chat.
@@ -62,6 +69,13 @@ pub struct RecalledMemory {
     pub origin_chat: ChatId,
     /// The person the fact is about, when it is about someone.
     pub subject: Option<SenderId>,
+    /// When the fact became true.
+    pub valid_from: chrono::DateTime<chrono::Utc>,
+    /// When it stopped being true, or `None` while it still holds.
+    ///
+    /// A superseded fact is recalled only for a question about the past, and is
+    /// rendered with the window it held so the model does not treat it as current.
+    pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ReaderContext {
@@ -167,6 +181,14 @@ impl<'a> ContextBuilder<'a> {
             body.push_str("<memories>\n");
             for memory in &visible {
                 body.push_str("- ");
+                // A superseded fact is only recalled for a question about the
+                // past; the window it held is named so the model does not read
+                // it as current.
+                if let Some(until) = memory.valid_to {
+                    body.push_str("(no longer true as of ");
+                    body.push_str(&until.date_naive().to_string());
+                    body.push_str(") ");
+                }
                 body.push_str(&escape(&memory.content));
                 body.push('\n');
             }
@@ -281,7 +303,7 @@ fn render_message(message: &StoredMessage) -> String {
 }
 
 /// Escapes the characters that could close a trust tag early.
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -322,6 +344,8 @@ mod tests {
             visibility,
             origin_chat: ChatId::new(origin),
             subject: None,
+            valid_from: Utc::now(),
+            valid_to: None,
         }
     }
 
@@ -442,6 +466,8 @@ mod tests {
             visibility: Visibility::Private,
             origin_chat: ChatId::new("dm"),
             subject: None,
+            valid_from: Utc::now(),
+            valid_to: None,
         };
         let memories = vec![private];
 
@@ -476,6 +502,8 @@ mod tests {
             visibility: Visibility::Chat,
             origin_chat: ChatId::new("gA"),
             subject: None,
+            valid_from: Utc::now(),
+            valid_to: None,
         }];
 
         let group_b = reader(ChatType::Group, "gB", &["gB"]);

@@ -17,7 +17,7 @@ milestone until the earlier one's exit criteria pass.**
 | 1. Skeleton — types, per-chat serialization, message store, trigger gate, single-call reply | **done** |
 | 2. Tracing + eval harness | **done** (trace log + deterministic evals) |
 | 3. Context builder, mode profiles, `ReaderContext` + visibility labels | **done** |
-| 4. Semantic memory (writer, retrieval, validity windows) | not started |
+| 4. Semantic memory (writer, retrieval, validity windows) | **done** |
 | 5. Tool loop | not started |
 | 6. Safety layer (output guard, confirmation gates, injection suite) | not started |
 | 7. Commands + rate limits (the deterministic command router) | not started |
@@ -28,13 +28,15 @@ milestone until the earlier one's exit criteria pass.**
 
 - `crates/megumi-agent/` — the platform-agnostic core (lib `megumi_agent`). No
   `whatsapp-rust` dependency. Modules: `event`, `config`, `store`, `queues`,
-  `gate`, `context`, `llm/`, `trace`, `agent`.
+  `gate`, `context`, `memory/`, `llm/`, `trace`, `agent`.
+- `crates/megumi-agent/src/memory/` — durable facts: `store` (records + the JSON
+  store), `writer` (extraction), `retrieval` (ranking behind the privacy filter).
 - `src/agent/mod.rs` — the WhatsApp adapter (`InboundMessage` → `InboundEvent`,
   mention/reply/identity detection, sending actions).
 - `src/events.rs` — the single framework `event_handler`, fanning out to the news
   digest and the agent.
-- `crates/megumi-agent/tests/{pipeline,eval,live}.rs` — end-to-end, eval, and
-  live smoke tests.
+- `crates/megumi-agent/tests/{pipeline,eval,memory,live}.rs` — end-to-end, eval,
+  memory, and live smoke tests.
 
 ## Decisions that must not regress
 
@@ -68,6 +70,13 @@ These were chosen deliberately; a later change that breaks one is a regression.
    the OpenAI shape. A `<ds_safety>` gateway annotation is stripped from replies.
 7. **Config, not code.** Budgets, windows, caps, and paths live in `AgentConfig`,
    env-overridable. Add new thresholds there, not inline.
+8. **A memory fact's privilege and time are set in code, never by the model.**
+   The extraction writer derives `visibility` from the chat type and `valid_from`
+   from the evidence messages, and drops any op whose evidence ids are not in the
+   batch. A model proposes facts; it cannot widen one's reach or invent a source.
+9. **Retrieval filters by `ReaderContext` before it ranks.** A fact the reader
+   may not see is never scored, so the private-to-group leak cannot happen
+   upstream of the filter.
 
 ## How to run and verify
 
@@ -86,45 +95,47 @@ cargo test -p megumi-agent --test live -- --ignored --nocapture
 The three reasoning evals in `crates/megumi-agent/tests/eval.rs` are `#[ignore]`d
 pending a live model; the rest run with `ScriptedLlm` and need no network.
 
-## Milestone 4 — semantic memory (the next one)
+## Milestone 4 — semantic memory (done)
 
-Goal: durable facts with provenance, bi-temporal validity, and hybrid retrieval,
-read through the existing `ReaderContext` boundary.
+Goal: durable facts with provenance, bi-temporal validity, and retrieval read
+through the existing `ReaderContext` boundary. Built in `crates/megumi-agent/src/memory/`:
 
-What already exists to build on:
+- `store.rs` — `MemoryRecord` (bi-temporal: `valid_from`/`valid_to`,
+  `recorded_at`, `superseded_by`, `source_message_ids`, `confidence`,
+  `importance`, `visibility`, `origin_chat`, `subject`), `MemoryOp`
+  (`Add`/`Update`/`Invalidate`/`Noop`), and `MemoryStore` (one JSON file, atomic
+  write, `:memory:` sentinel, mirroring `store.rs`). `apply` is the only mutator
+  and takes a whole batch plus the new cursor, so a pass is one write.
+- `writer.rs` — `extract_if_due`: collects the messages since the chat's cursor,
+  asks the model for a JSON array of ops with evidence ids, validates each in
+  code, and applies the batch. Trigger: 25 new messages, or a 10-minute idle
+  backlog. The cursor is a message id; a transport failure leaves it unadvanced
+  (retried), an unparseable reply advances it (not re-run).
+- `retrieval.rs` — `search`: filter by `reader.permits` **first**, then rank
+  `0.5·similarity + 0.2·recency + 0.2·importance + 0.1·confidence`, only
+  still-true facts unless the question reads as being about the past, top
+  `memory_recall_top` (8).
+- `agent.rs` runs `extract_if_due` in `respond` before the gate (so a silent,
+  busy group still extracts before the window prunes), and `run_turn` passes
+  `search(...)` to the context builder instead of an empty slice.
+- Evals: `crates/megumi-agent/tests/memory.rs` (recall, knowledge update with
+  history, private canary, cursor durability), plus unit tests in each module.
 
-- `context.rs` has `RecalledMemory { content, visibility, origin_chat, subject }`
-  and `ReaderContext::visible`, and `ContextBuilder::build` already takes a
-  `&[RecalledMemory]` and renders a `<memories>` layer. Today the agent passes an
-  empty slice (`agent.rs::run_turn`); wire retrieval in there.
-- `store.rs` is the model for a JSON store (atomic write, `:memory:` sentinel,
-  open at build time). A memory store should mirror it.
+**v1 stands in for embeddings with lexical similarity.** The configured provider
+(Anthropic Messages API) has no embeddings endpoint, so `retrieval::similarity`
+compares words; replace that one function with a vector score when an eval needs
+it, and do not add a vector database before then.
 
-Exit criteria (from the spec): recall and knowledge-update suites pass — a fact
-stated hundreds of messages ago is retrieved; after a fact changes, the newest
-value is used and the old one is still answerable as history.
+**Do not regress:** the model never chooses `visibility` (the writer derives it
+from the chat type), and every fact must cite evidence message ids that are in
+the batch, so a model cannot widen a fact's reach or invent a source. Extraction
+runs under the per-chat turn lock, and a failed pass is logged, never fatal.
 
-Suggested order, each step testable on its own:
+## Milestone 5 — the tool loop (the next one)
 
-1. `MemoryRecord` + a `MemoryStore` (JSON, per the `store.rs` pattern) with the
-   bi-temporal fields: `valid_from`/`valid_to` (null = still true), `recorded_at`,
-   `superseded_by`, `source_message_ids`, `confidence`, `importance`,
-   `visibility`, `origin_chat`, `subject`.
-2. A write pipeline (`memory/writer.rs`): collect new messages since the last
-   pass, ask the model for `ADD | UPDATE | INVALIDATE | NOOP` operations with
-   evidence ids (structured output), validate in code, apply transactionally.
-   Trigger: every N messages or after idle (defaults: 25 messages / 10 min).
-3. Retrieval (`memory/retrieval.rs`): hybrid (vector + keyword + metadata
-   filters), filter by `ReaderContext` **first**, then rank by
-   `w1·similarity + w2·recency + w3·importance + w4·confidence`; only
-   `valid_to IS NULL` unless the question is about the past. Inject the top 5–8.
-4. Wire retrieval into `run_turn` and add a `search_memory` tool seam (the tool
-   loop itself is milestone 5).
-5. Evals: seeded memory recall, knowledge update, temporal resolution, and a
-   canary that a private memory still cannot reach a group.
-
-Embeddings: v1 can brute-force cosine over arrays stored in the JSON; do not add
-a vector database until an eval shows it is needed.
+Goal: let the model call tools mid-turn (a `search_memory` tool over
+`retrieval::search`, web/command tools), with the loop bounded and every call
+traced. Milestone 4's `retrieval::search` is the seam the first tool builds on.
 
 ## Milestone 7 — the command router (note)
 

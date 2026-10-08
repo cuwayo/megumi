@@ -16,6 +16,7 @@ use crate::context::{ContextBuilder, ReaderContext};
 use crate::event::{ChatType, InboundEvent, OutboundAction};
 use crate::gate::{self, GateDecision, Trigger};
 use crate::llm::{LlmClient, LlmError, LlmRequest};
+use crate::memory::{MemoryStore, retrieval, writer};
 use crate::queues::ChatQueues;
 use crate::store::{MessageStore, StoredMessage};
 use crate::trace::{self, TraceSink, TurnTrace};
@@ -27,6 +28,7 @@ const NO_REPLY: &str = "NO_REPLY";
 /// that keep a chat's turns in order.
 pub struct Agent {
     store: Arc<MessageStore>,
+    memory: Arc<MemoryStore>,
     traces: Arc<TraceSink>,
     llm: Arc<dyn LlmClient>,
     config: AgentConfig,
@@ -34,15 +36,17 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Builds an agent over an existing store, trace log, and model.
+    /// Builds an agent over an existing store, memory, trace log, and model.
     pub fn new(
         store: Arc<MessageStore>,
+        memory: Arc<MemoryStore>,
         traces: Arc<TraceSink>,
         llm: Arc<dyn LlmClient>,
         config: AgentConfig,
     ) -> Self {
         Self {
             store,
+            memory,
             traces,
             llm,
             config,
@@ -81,6 +85,24 @@ impl Agent {
     ) -> Result<Option<OutboundAction>, crate::Error> {
         let _guard = self.queues.lock(&event.chat).await;
 
+        // Extract before deciding whether to answer: the adapter calls this for
+        // every message, so a busy group that never triggers the agent still
+        // turns its messages into facts before the message window prunes them.
+        // A failed pass is logged, never fatal to the turn — memory is a
+        // background concern, the reply is not.
+        if let Err(error) = writer::extract_if_due(
+            self.llm.as_ref(),
+            &self.store,
+            &self.memory,
+            &self.config,
+            &event.chat,
+            event.chat_type,
+        )
+        .await
+        {
+            warn!(chat = %event.chat, %error, "the memory extraction pass failed");
+        }
+
         match gate::decide(event) {
             GateDecision::StaySilent(reason) => {
                 debug!(chat = %event.chat, ?reason, "the agent stayed silent");
@@ -103,9 +125,15 @@ impl Agent {
         let history = self.store.recent(&event.chat, window)?;
         let summary = self.store.summary(&event.chat)?;
 
-        // Memories arrive with milestone 4; the builder and the privacy filter
-        // are already in place so retrieval drops in without a rewrite.
-        let memories: Vec<crate::context::RecalledMemory> = Vec::new();
+        // The facts this reader may see, filtered and ranked by the retrieval
+        // layer's privacy boundary. The context builder re-checks every one.
+        let memories = retrieval::search(
+            &reader,
+            event.trimmed_text(),
+            &self.memory,
+            &self.config,
+            chrono::Utc::now(),
+        )?;
         let prompt = ContextBuilder::new(&self.config).build(
             &reader,
             summary.as_deref(),
@@ -168,6 +196,11 @@ impl Agent {
         &self.store
     }
 
+    /// The memory store, for tests and diagnostics.
+    pub fn memory(&self) -> &MemoryStore {
+        &self.memory
+    }
+
     /// The trace log, for tests and diagnostics.
     pub fn traces(&self) -> &TraceSink {
         &self.traces
@@ -209,8 +242,9 @@ mod tests {
             }
         })));
         let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
+        let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
         let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
-        let agent = Agent::new(store, traces, llm.clone(), AgentConfig::for_test());
+        let agent = Agent::new(store, memory, traces, llm.clone(), AgentConfig::for_test());
         (agent, llm)
     }
 

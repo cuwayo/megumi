@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use megumi_agent::{AgentConfig, MessageStore, ScriptedLlm, TraceSink};
+use megumi_agent::{AgentConfig, MemoryStore, MessageStore, ScriptedLlm, TraceSink};
 use megumi_whatsapp::agent::on_messages;
 use megumi_whatsapp::{Data, NewsStore};
 use whatsapp_rust::bot::Bot;
@@ -23,10 +23,12 @@ use whatsapp_rust::{Client, Jid};
 /// Builds a bot's `Data` over in-memory stores and a scripted model.
 fn data() -> Data {
     let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
+    let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
     let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
     let llm = Arc::new(ScriptedLlm::always("hello from the agent"));
     let agent = Arc::new(megumi_agent::Agent::new(
         store,
+        memory,
         traces,
         llm,
         AgentConfig::for_test(),

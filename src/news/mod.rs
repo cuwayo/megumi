@@ -36,6 +36,11 @@ const TICK: Duration = Duration::from_secs(60);
 /// leaves two loops running. On `Disconnected` or `LoggedOut` it stops the loop,
 /// so a dropped or unlinked session does not leave a loop ticking against a dead
 /// client (and holding it alive) until the process ends.
+///
+/// A `Connected` delivered late — its handler still waiting on the lock when a
+/// later `Disconnected` has already run — starts nothing: it re-checks the
+/// client's connected flag under the lock, so it cannot resurrect the loop after
+/// the disconnect stopped it.
 pub fn event_handler(
     ctx: FrameworkContext<Data>,
     event: Arc<Event>,
@@ -44,11 +49,27 @@ pub fn event_handler(
         match &*event {
             Event::Connected(_) => {
                 info!("Connected with WhatsApp");
-                let next = tokio::spawn(run(ctx.client.clone(), Arc::clone(&ctx.data.news)));
-                replace_digest(&ctx.data.news_task, Some(next)).await;
+                let mut slot = ctx.data.news_task.lock().await;
+                // Re-check under the lock: delivery is concurrent, so this
+                // handler may have been scheduled after a later `Disconnected`
+                // ran. The client clears `is_connected` before dispatching a
+                // disconnect, so a stale `Connected` is rejected here rather
+                // than resurrecting the loop that disconnect just stopped.
+                if !ctx.client.is_connected() {
+                    return Ok(());
+                }
+                stop(&mut slot).await;
+                // Spawned with the slot still locked, and with no `await`
+                // between the spawn and the store, so cancelling this handler
+                // cannot leave the new loop running untracked.
+                *slot = Some(tokio::spawn(run(
+                    ctx.client.clone(),
+                    Arc::clone(&ctx.data.news),
+                )));
             }
             Event::Disconnected(_) | Event::LoggedOut(_) => {
-                replace_digest(&ctx.data.news_task, None).await;
+                let mut slot = ctx.data.news_task.lock().await;
+                stop(&mut slot).await;
             }
             _ => {}
         }
@@ -56,21 +77,16 @@ pub fn event_handler(
     })
 }
 
-/// Swaps the digest loop for `next`, stopping the running one first and waiting
-/// for it to finish so the two never overlap.
+/// Stops the digest loop in `slot`, aborting it and waiting for it to finish so
+/// a replacement never overlaps it, and leaves the slot empty.
 ///
-/// The whole swap is one critical section, so two `Connected` events arriving
-/// together cannot both start a loop.
-async fn replace_digest(
-    task: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    next: Option<tokio::task::JoinHandle<()>>,
-) {
-    let mut guard = task.lock().await;
-    if let Some(previous) = guard.take() {
+/// The caller holds the task-slot lock for the whole swap, so two `Connected`
+/// events arriving together cannot both start a loop.
+async fn stop(slot: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(previous) = slot.take() {
         previous.abort();
         let _ = previous.await;
     }
-    *guard = next;
 }
 
 /// Posts the morning digest to every group that asked for it.

@@ -12,7 +12,7 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::config::AgentConfig;
-use crate::context::{ContextBuilder, ReaderContext, escape, render_memory, truncate};
+use crate::context::{ContextBuilder, Prompt, ReaderContext, escape, render_memory, truncate};
 use crate::event::{ChatId, ChatType, InboundEvent, OutboundAction};
 use crate::gate::{self, GateDecision, Trigger};
 use crate::llm::{
@@ -21,6 +21,7 @@ use crate::llm::{
 use crate::memory::store::{MemoryOp, MemoryRecord};
 use crate::memory::{MemoryStore, retrieval, writer};
 use crate::queues::ChatQueues;
+use crate::reasoning::{self, Usage};
 use crate::safety::{self, Confirmation, PendingConfirmations, PendingToolCall};
 use crate::store::{MessageStore, StoredMessage};
 use crate::tools::ToolRegistry;
@@ -307,10 +308,12 @@ impl Agent {
     /// Runs a turn, optionally seeded with a transcript a tool result already
     /// produced.
     ///
-    /// An ordinary turn passes no seed and advertises tools; the confirmation
-    /// path seeds the run with the held call and its result and advertises no
-    /// tools, so the model just narrates what happened. One function keeps one
-    /// copy of the prompt-building, loop, trace, and guard.
+    /// An ordinary turn plans before it answers, runs the model loop, then has
+    /// the evaluator judge the draft and revise it if asked; the confirmation
+    /// path seeds the run with the held call and its result, advertises no
+    /// tools, and skips planning and evaluation, so the model just narrates what
+    /// happened. One function keeps one copy of the prompt-building, loop,
+    /// trace, and guard.
     async fn run_turn(
         &self,
         event: &InboundEvent,
@@ -336,7 +339,30 @@ impl Agent {
             &self.config,
             chrono::Utc::now(),
         )?;
-        let prompt = ContextBuilder::new(&self.config).build(
+
+        // A seeded turn is a narration or a revision already in flight; it does
+        // not plan. `allow_tools` marks the ordinary path — a confirmation turn
+        // passes false — so an ordinary turn plans only when the request is
+        // non-trivial, and the plan becomes a prompt layer.
+        let mut reasoning_usage = Usage::default();
+        let mut plan_steps = Vec::new();
+        if allow_tools {
+            let (planned, usage) = reasoning::plan(
+                self.llm.as_ref(),
+                &self.config,
+                event.chat_type,
+                summary.as_deref(),
+                event,
+            )
+            .await;
+            reasoning_usage = add_usage(reasoning_usage, usage);
+            if let Some(steps) = planned {
+                plan_steps = steps;
+            }
+        }
+        let plan_layer = (!plan_steps.is_empty()).then(|| reasoning::render_plan(&plan_steps));
+
+        let prompt = ContextBuilder::new(&self.config).plan(plan_layer).build(
             &reader,
             summary.as_deref(),
             &memories,
@@ -344,23 +370,146 @@ impl Agent {
             event,
         );
 
+        let started = Instant::now();
+
+        // The main loop: the model answers, possibly after calling tools. A
+        // seeded turn (confirmation or revision) carries a transcript to start
+        // from and advertises no tools of its own.
+        let mut outcome = self
+            .model_loop(
+                event,
+                &reader,
+                &prompt,
+                seed_messages,
+                seed_calls,
+                allow_tools,
+            )
+            .await;
+
+        // The evaluator judges the draft and, when it asks for a revision, one
+        // more turn rewrites it — bounded by the revision budget. It runs on the
+        // ordinary path only (`allow_tools`): a narration turn is not judged, and
+        // a turn that will not speak has nothing to judge.
+        let mut revisions = 0;
+        let mut verdict_label = None;
+        if allow_tools && self.config.max_revisions > 0 {
+            loop {
+                let candidate = match &outcome.reply {
+                    Some(text) if !safety::is_silent(text) => text.clone(),
+                    _ => break,
+                };
+                let (verdict, usage) = reasoning::evaluate(
+                    self.llm.as_ref(),
+                    &self.config,
+                    event.trimmed_text(),
+                    &candidate,
+                )
+                .await;
+                reasoning_usage = add_usage(reasoning_usage, usage);
+                let Some(verdict) = verdict else {
+                    break;
+                };
+                verdict_label = Some(if verdict.accept {
+                    "ACCEPT".to_string()
+                } else {
+                    "REVISE".to_string()
+                });
+                if verdict.accept || revisions >= self.config.max_revisions {
+                    break;
+                }
+                // Revise: run the same loop again, seeded with the draft and the
+                // critique and advertising no tools, so the model just improves
+                // the reply. A failed revision leaves the draft in place.
+                let seed = reasoning::revision_seed(&candidate, &verdict.reason);
+                let revised = self
+                    .model_loop(event, &reader, &prompt, seed, Vec::new(), false)
+                    .await;
+                reasoning_usage = add_usage(
+                    reasoning_usage,
+                    Usage {
+                        input: revised.input_tokens,
+                        output: revised.output_tokens,
+                    },
+                );
+                if let Some(text) = revised.reply {
+                    outcome.reply = Some(text);
+                }
+                outcome.calls.extend(revised.calls);
+                revisions += 1;
+            }
+        }
+        let latency = started.elapsed();
+
+        // The output guard is the one place a reply becomes sendable: it drops a
+        // `NO_REPLY`, an empty reply, one carrying the prompt's own tags, or one
+        // reciting the system prompt, and truncates the rest.
+        let final_reply = match outcome.reply {
+            Some(text) => {
+                let screened = safety::screen_reply(&text, &prompt.system, &self.config);
+                if screened.is_none() {
+                    debug!(chat = %event.chat, "the output guard suppressed the reply");
+                }
+                screened
+            }
+            None => None,
+        };
+        self.traces.record(TurnTrace {
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            chat: event.chat.clone(),
+            trigger: TurnTrace::trigger_label(trigger).to_string(),
+            model: self.config.model.clone(),
+            context_hash: trace::context_hash(&prompt.system, &prompt.user),
+            system_chars: prompt.system.chars().count(),
+            user_chars: prompt.user.chars().count(),
+            input_tokens: add_tokens(outcome.input_tokens, reasoning_usage.input),
+            output_tokens: add_tokens(outcome.output_tokens, reasoning_usage.output),
+            latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+            tool_calls: outcome.calls,
+            plan: plan_steps,
+            revisions,
+            verdict: verdict_label,
+            reply: final_reply.clone(),
+            timestamp: chrono::Utc::now(),
+        })?;
+
+        Ok(final_reply.map(|text| OutboundAction::SendText {
+            chat: event.chat.clone(),
+            text,
+        }))
+    }
+
+    /// Runs the bounded model loop for one turn.
+    ///
+    /// Calls the model, runs any tools it asks for, and feeds the results back,
+    /// up to [`AgentConfig::max_tool_iterations`]. A state-changing tool call is
+    /// held for confirmation rather than run. Returns the reply (if any), the
+    /// tool calls it recorded, and the tokens it spent. Extracted so the turn
+    /// and its revision share one loop.
+    async fn model_loop(
+        &self,
+        event: &InboundEvent,
+        reader: &ReaderContext,
+        prompt: &Prompt,
+        seed_messages: Vec<LlmMessage>,
+        seed_calls: Vec<ToolCallTrace>,
+        allow_tools: bool,
+    ) -> TurnOutcome {
         // The tools the model may call this turn: the reader-bound memory
         // search, then the registry's reader-independent tools. A seeded turn
-        // advertises none — it only narrates a result already in hand.
+        // advertises none — it only narrates or rewrites what it was handed.
         let tools = if allow_tools {
             self.turn_tools()
         } else {
             Vec::new()
         };
 
-        let started = Instant::now();
         let mut messages = vec![LlmMessage::Text {
             assistant: false,
             text: prompt.user.clone(),
         }];
         messages.extend(seed_messages);
         let mut calls = seed_calls;
-        // Summed over the turn's calls, staying `None` until a call reports a
+        // Summed over the loop's calls, staying `None` until a call reports a
         // count — the same answer a single call gave before the loop existed.
         let mut input_tokens: Option<u32> = None;
         let mut output_tokens: Option<u32> = None;
@@ -437,46 +586,18 @@ impl Agent {
             // The model asked for tools. Run each, record it, and feed the
             // results back as the next turn's input.
             let results = self
-                .run_tool_calls(&reader, &response.tool_calls, &mut calls)
+                .run_tool_calls(reader, &response.tool_calls, &mut calls)
                 .await;
             messages.push(LlmMessage::ToolCalls(response.tool_calls));
             messages.push(LlmMessage::ToolResults(results));
         }
-        let latency = started.elapsed();
 
-        // The output guard is the one place a reply becomes sendable: it drops a
-        // `NO_REPLY`, an empty reply, one carrying the prompt's own tags, or one
-        // reciting the system prompt, and truncates the rest.
-        let final_reply = match reply {
-            Some(text) => {
-                let screened = safety::screen_reply(&text, &prompt.system, &self.config);
-                if screened.is_none() {
-                    debug!(chat = %event.chat, "the output guard suppressed the reply");
-                }
-                screened
-            }
-            None => None,
-        };
-        self.traces.record(TurnTrace {
-            turn_id: uuid::Uuid::new_v4().to_string(),
-            chat: event.chat.clone(),
-            trigger: TurnTrace::trigger_label(trigger).to_string(),
-            model: self.config.model.clone(),
-            context_hash: trace::context_hash(&prompt.system, &prompt.user),
-            system_chars: prompt.system.chars().count(),
-            user_chars: prompt.user.chars().count(),
+        TurnOutcome {
+            reply,
+            calls,
             input_tokens,
             output_tokens,
-            latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
-            tool_calls: calls,
-            reply: final_reply.clone(),
-            timestamp: chrono::Utc::now(),
-        })?;
-
-        Ok(final_reply.map(|text| OutboundAction::SendText {
-            chat: event.chat.clone(),
-            text,
-        }))
+        }
     }
 
     /// Runs a held tool call the user has confirmed, then a final turn that
@@ -660,6 +781,26 @@ fn add_tokens(total: Option<u32>, reported: Option<u32>) -> Option<u32> {
         (Some(total), None) => Some(total),
         (None, reported) => reported,
     }
+}
+
+/// Adds one reasoning call's usage to the turn's running reasoning total.
+fn add_usage(total: Usage, reported: Usage) -> Usage {
+    Usage {
+        input: add_tokens(total.input, reported.input),
+        output: add_tokens(total.output, reported.output),
+    }
+}
+
+/// What one run of the model loop produced.
+struct TurnOutcome {
+    /// The reply the model settled on, or `None` when no call returned one.
+    reply: Option<String>,
+    /// The tool calls the loop ran, recorded for the trace.
+    calls: Vec<ToolCallTrace>,
+    /// Input tokens the loop's calls reported, summed.
+    input_tokens: Option<u32>,
+    /// Output tokens the loop's calls reported, summed.
+    output_tokens: Option<u32>,
 }
 
 /// The prompt for the `!summary` pass: the messages to summarise.

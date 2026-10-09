@@ -85,6 +85,29 @@ pub struct AgentConfig {
     pub web_search_max_chars: usize,
     /// The base URL of the web-search API.
     pub web_search_base: String,
+    /// Whether a turn plans before it answers.
+    ///
+    /// The planner makes one extra model call to sketch a short plan for a
+    /// non-trivial request; the plan becomes a prompt layer the main call reasons
+    /// over. A quality feature, not a correctness one, so a failed plan is
+    /// simply absent.
+    pub planner_enabled: bool,
+    /// How many words a request needs before the planner runs.
+    ///
+    /// A greeting or a one-line question does not need a plan, so the planner is
+    /// skipped below this length rather than spending a call on every turn.
+    pub plan_min_words: usize,
+    /// The most tokens a planning reply may use.
+    pub plan_max_tokens: u32,
+    /// How many times the evaluator may send a reply back for revision.
+    ///
+    /// Zero disables the evaluator entirely. One is the default: the evaluator
+    /// critiques the draft once, and a revision is re-evaluated but not revised
+    /// again, so a model that keeps asking for changes is cut off rather than
+    /// looped.
+    pub max_revisions: u32,
+    /// The most tokens an evaluator reply may use.
+    pub evaluator_max_tokens: u32,
 }
 
 impl Default for AgentConfig {
@@ -115,6 +138,11 @@ impl Default for AgentConfig {
             web_search_results: 5,
             web_search_max_chars: 4_000,
             web_search_base: "https://api.tavily.com".to_string(),
+            planner_enabled: true,
+            plan_min_words: 12,
+            plan_max_tokens: 256,
+            max_revisions: 1,
+            evaluator_max_tokens: 128,
         }
     }
 }
@@ -181,6 +209,17 @@ impl AgentConfig {
             web_search_max_chars: env_usize("AGENT_WEB_SEARCH_MAX_CHARS")
                 .unwrap_or(default.web_search_max_chars),
             web_search_base: std::env::var("TAVILY_API_BASE").unwrap_or(default.web_search_base),
+            planner_enabled: env_bool("AGENT_PLANNING_ENABLED").unwrap_or(default.planner_enabled),
+            plan_min_words: env_usize("AGENT_PLAN_MIN_WORDS").unwrap_or(default.plan_min_words),
+            plan_max_tokens: env_usize("AGENT_PLAN_TOKENS")
+                .map(|tokens| tokens as u32)
+                .unwrap_or(default.plan_max_tokens),
+            max_revisions: env_usize("AGENT_MAX_REVISIONS")
+                .map(|revisions| revisions as u32)
+                .unwrap_or(default.max_revisions),
+            evaluator_max_tokens: env_usize("AGENT_EVAL_TOKENS")
+                .map(|tokens| tokens as u32)
+                .unwrap_or(default.evaluator_max_tokens),
         }
     }
 
@@ -190,13 +229,19 @@ impl AgentConfig {
     /// and the idle gap is forever — so a test that is not about memory never
     /// spends a scripted model reply on an extraction pass. A memory test lowers
     /// the threshold itself. Tools are off too, so a test that is not about the
-    /// tool loop never sees one; a tool test raises the bound itself.
+    /// tool loop never sees one; a tool test raises the bound itself. Planning
+    /// and evaluation are off for the same reason: a test that is not about
+    /// reasoning never spends a reply on a plan or a critique, and the tests
+    /// that assert exact request counts stay exact. A reasoning test turns them
+    /// back on itself.
     pub fn for_test() -> Self {
         Self {
             store_dir: PathBuf::from(":memory:"),
             memory_extract_batch: usize::MAX,
             memory_extract_idle: Duration::MAX,
             max_tool_iterations: 0,
+            planner_enabled: false,
+            max_revisions: 0,
             ..Self::default()
         }
     }
@@ -242,6 +287,23 @@ impl AgentConfig {
 
 fn env_usize(key: &str) -> Option<usize> {
     std::env::var(key).ok()?.parse().ok()
+}
+
+/// Reads a boolean flag, accepting the usual spellings.
+///
+/// A value the parser does not recognise is `None`, the same as an unset
+/// variable, so a typo falls back to the default rather than failing to start.
+fn env_bool(key: &str) -> Option<bool> {
+    match std::env::var(key)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

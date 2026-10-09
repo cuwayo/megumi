@@ -41,6 +41,8 @@ const INTERNAL_TAGS: &[&str] = &[
     "</memories",
     "<conversation_summary",
     "</conversation_summary",
+    "<plan",
+    "</plan",
     "<reply_to",
     "</reply_to",
 ];
@@ -61,7 +63,7 @@ const MIN_LEAK_CHARS: usize = 40;
 /// or the model's instructions into a chat.
 pub fn screen_reply(reply: &str, system: &str, config: &AgentConfig) -> Option<String> {
     let trimmed = reply.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(NO_REPLY) {
+    if is_silent(trimmed) {
         return None;
     }
     let lower = trimmed.to_lowercase();
@@ -69,6 +71,16 @@ pub fn screen_reply(reply: &str, system: &str, config: &AgentConfig) -> Option<S
         return None;
     }
     Some(truncate(trimmed, config.max_reply_chars))
+}
+
+/// Whether `reply` is one the agent treats as "say nothing".
+///
+/// An empty reply and a `NO_REPLY` both mean silence. Shared with the reasoning
+/// layer, which must not spend an evaluator call judging a reply that will not
+/// be sent.
+pub(crate) fn is_silent(reply: &str) -> bool {
+    let trimmed = reply.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case(NO_REPLY)
 }
 
 /// Whether `reply` quotes a long run of the system prompt verbatim.

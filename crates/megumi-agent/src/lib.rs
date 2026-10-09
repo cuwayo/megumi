@@ -25,6 +25,7 @@
 //! - `llm` - the [`LlmClient`] trait, the Anthropic client, and test doubles
 //! - `tools` - the [`Tool`] trait, [`ToolRegistry`], and the web-search tool
 //! - `safety` - the output guard and the confirmation gate for tools
+//! - `reasoning` - the planner and the evaluator that bracket a turn
 //! - `trace` - the replayable record of every turn
 //! - `agent` - [`Agent`], which runs the pipeline
 
@@ -38,6 +39,7 @@ pub mod gate;
 pub mod llm;
 pub mod memory;
 pub mod queues;
+pub mod reasoning;
 pub mod safety;
 pub mod store;
 pub mod tools;

@@ -219,6 +219,11 @@ optional; without the file the bot runs with sticker-pack conversion disabled.
 | `TAVILY_API_BASE` | `https://api.tavily.com` | Web-search API base; override for a proxy |
 | `AGENT_WEB_SEARCH_RESULTS` | `5` | Results a web search asks for |
 | `AGENT_WEB_SEARCH_MAX_CHARS` | `4000` | Characters of web-search results handed to the model |
+| `AGENT_PLANNING_ENABLED` | `true` | Whether a turn plans before it answers |
+| `AGENT_PLAN_MIN_WORDS` | `12` | Words a request needs before the planner runs |
+| `AGENT_PLAN_TOKENS` | `256` | Most tokens a planning reply may use |
+| `AGENT_MAX_REVISIONS` | `1` | Times the evaluator may send a reply back for revision; `0` disables the evaluator |
+| `AGENT_EVAL_TOKENS` | `128` | Most tokens an evaluator reply may use |
 
 ## Development
 

@@ -56,6 +56,24 @@ pub struct TurnTrace {
     /// loads.
     #[serde(default)]
     pub tool_calls: Vec<ToolCallTrace>,
+    /// The plan the planner produced this turn, one step per entry.
+    ///
+    /// Empty when the turn did not plan — planning is off, the request was too
+    /// short, or the planner's reply was unusable. Defaulted so an old trace
+    /// log still loads.
+    #[serde(default)]
+    pub plan: Vec<String>,
+    /// How many times the evaluator sent the reply back for revision.
+    ///
+    /// Defaulted so an old trace log still loads.
+    #[serde(default)]
+    pub revisions: u32,
+    /// The evaluator's verdict on the final reply, when it ran.
+    ///
+    /// `"ACCEPT"`, `"REVISE"`, or `None` when the evaluator did not run or its
+    /// reply could not be read. Defaulted so an old trace log still loads.
+    #[serde(default)]
+    pub verdict: Option<String>,
     /// The reply the agent decided on, or `None` when it stayed silent.
     pub reply: Option<String>,
     /// When the turn finished.
@@ -200,6 +218,9 @@ mod tests {
             output_tokens: Some(3),
             latency_ms: 100,
             tool_calls: Vec::new(),
+            plan: Vec::new(),
+            revisions: 0,
+            verdict: None,
             reply: Some("hi".into()),
             timestamp: Utc::now(),
         }

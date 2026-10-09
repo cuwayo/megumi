@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::config::AgentConfig;
-use crate::context::{Visibility, escape, truncate};
+use crate::context::{Visibility, escape, strip_code_fence, truncate};
 use crate::event::{ChatId, ChatType, SenderId};
 use crate::llm::{LlmClient, LlmError, LlmRequest};
 use crate::memory::store::{MemoryOp, MemoryRecord, MemoryStore, NewFact};
@@ -221,18 +221,7 @@ struct RawOp {
 /// parse, the widest bracketed slice is tried. `None` means nothing parseable,
 /// which the caller treats as "no facts this pass".
 fn parse_ops(text: &str) -> Option<Vec<RawOp>> {
-    let trimmed = text.trim();
-    let body = trimmed
-        .strip_prefix("```")
-        .map(|rest| {
-            rest.strip_prefix("json")
-                .or_else(|| rest.strip_prefix("JSON"))
-                .unwrap_or(rest)
-        })
-        .and_then(|rest| rest.strip_suffix("```"))
-        .map(str::trim)
-        .unwrap_or(trimmed);
-
+    let body = strip_code_fence(text);
     if let Ok(ops) = serde_json::from_str::<Vec<RawOp>>(body) {
         return Some(ops);
     }

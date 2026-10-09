@@ -219,7 +219,8 @@ window), `queues` (one turn at a time per chat), `gate` (pure trigger decision),
 builder and the `ReaderContext`/`Visibility` privacy boundary), `memory` (durable facts: `store` records +
 JSON store, `writer` extraction, `retrieval` ranking), `tools` (the `Tool` trait, `ToolRegistry`, and the
 `WebSearch` tool), `safety` (the output guard `screen_reply` and the confirmation gate
-`PendingConfirmations`), `llm` (the `LlmClient` trait, the Anthropic client, and test doubles), `trace`
+`PendingConfirmations`), `reasoning` (the planner and the evaluator that bracket a turn), `llm` (the
+`LlmClient` trait, the Anthropic client, and test doubles), `trace`
 (replayable turn log), `agent` (`Agent::ingest` and `Agent::respond`).
 
 **Memory (milestone 4)** is wired into `respond`: before the gate it runs `memory::writer::extract_if_due`
@@ -245,6 +246,18 @@ turn after the user's "yes" (`PendingConfirmations`, per chat, in memory, expiri
 `confirmation_ttl`). `run_turn` takes an optional seed so that confirmation turn reuses the same loop, trace,
 and guard. The confirmation answer is resolved *before* `gate::decide`, so a private "ok" is not swallowed
 as an acknowledgement — and in a group only a message directed at the bot (mention or reply) can answer it.
+
+**The reasoning layer (milestone 8)** is `reasoning.rs`, bracketing an ordinary turn. Before the turn,
+`reasoning::plan` makes one model call — only when `planner_enabled` and the request is at least
+`plan_min_words` long — and its steps become a `<plan>` prompt layer. After the turn, `reasoning::evaluate`
+makes one model call that returns `ACCEPT` or `REVISE`; on `REVISE` the turn runs `model_loop` again, seeded
+by `revision_seed` with the draft and the critique, bounded by `max_revisions` (default 1; 0 disables the
+evaluator). Both passes **fail open** — an unreadable plan or verdict changes nothing — so reasoning can
+never suppress a reply, and the output guard still runs last. They run on the ordinary path only: a
+confirmation narration turn is not planned or judged, and a silent reply is not evaluated. Neither pass
+reads memory or takes a `ReaderContext`, so there is no new privacy surface; the revision reuses the turn's
+own prompt. `run_turn` calls the extracted `model_loop` for the turn and for each revision; the plan,
+revision count, and verdict are recorded on the `TurnTrace`.
 
 Rules that are easy to break:
 

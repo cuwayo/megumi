@@ -21,7 +21,7 @@ milestone until the earlier one's exit criteria pass.**
 | 5. Tool loop | **done** (`search_memory`, `web_search`) |
 | 6. Safety layer (output guard, confirmation gates, injection suite) | **done** |
 | 7. Commands + rate limits (the deterministic command router) | **done** (`!ask`, `!summary`, `!memory`, `!forget`, `!remind`) |
-| 8. Planner/evaluator | not started |
+| 8. Planner/evaluator | **done** (plan before, evaluate + bounded revise after) |
 | 9. Consolidation, reflections, tuning | not started |
 
 ### Where things live
@@ -35,6 +35,8 @@ milestone until the earlier one's exit criteria pass.**
   the `WebSearch` tool.
 - `crates/megumi-agent/src/safety.rs` — the output guard, the confirmation gate,
   and the pending-confirmation store.
+- `crates/megumi-agent/src/reasoning.rs` — the planner and the evaluator, the two
+  passes that bracket a turn.
 - `src/agent/mod.rs` — the WhatsApp adapter (`InboundMessage` → `InboundEvent`,
   mention/reply/identity detection, sending actions). `event_from_parts` is the
   shared core both a live message and a command's `MessageContext` go through.
@@ -44,8 +46,9 @@ milestone until the earlier one's exit criteria pass.**
   (mirrors `src/news/`).
 - `src/events.rs` — the single framework `event_handler`, fanning out to the news
   digest, the reminders, and the agent.
-- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,router,live}.rs` —
-  end-to-end, eval, memory, tool-loop, prompt-injection, and live smoke tests.
+- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,router,reasoning,live}.rs` —
+  end-to-end, eval, memory, tool-loop, prompt-injection, reasoning, and live smoke
+  tests.
 
 ## Decisions that must not regress
 
@@ -274,10 +277,66 @@ past-cue questions, so `MemoryOp::Forget` sets `MemoryRecord::forgotten` and
 retrieval drops forgotten records in both current and past modes. Reminders are
 per chat, so a DM cannot list or cancel another chat's.
 
+## Milestone 8 — the planner/evaluator (done)
+
+Goal: a reasoning pass before a turn and a critique after it, both optional and
+both failing open. Built in `crates/megumi-agent/src/reasoning.rs`, with the
+passes wired into `agent.rs::run_turn`:
+
+- `reasoning.rs::plan` — one model call before the turn, returning a short list
+  of steps that the context builder renders as a `<plan>` layer. It runs only
+  when `planner_enabled` is set **and** the request has at least `plan_min_words`
+  words, so a greeting is not planned. The prompt is shaped like the memory
+  writer's extraction prompt (a stable instruction plus the trust-tagged,
+  escaped request); the reply is parsed with the same fence-strip + bracket-slice
+  robustness as `writer::parse_ops`, now shared as `context::strip_code_fence`.
+- `reasoning.rs::evaluate` — one model call after a draft exists, returning
+  `{"verdict":"ACCEPT"|"REVISE","reason":"..."}`. A verdict that cannot be read
+  is `None`, which the caller treats as **ACCEPT**: the evaluator is a quality
+  gate, not a safety gate, so it can only ever improve a reply, never suppress
+  one.
+- `reasoning.rs::revision_seed` — on `REVISE`, the caller runs one more turn
+  through the same `model_loop`, seeded with the draft as an assistant turn and
+  the critique as the next user turn, so the model improves the reply. Revisions
+  are bounded by `max_revisions` (default 1; 0 disables the evaluator), so a
+  model that keeps asking for changes is cut off rather than looped.
+- `agent.rs::run_turn` now calls `model_loop` (the extracted bounded tool loop)
+  for the ordinary turn and again for a revision. Planning and evaluation run on
+  the ordinary path only — a `Trigger::Confirmation` narration turn is neither
+  planned nor judged, and a reply that is silent (`NO_REPLY`/empty) is not
+  evaluated. The output guard still runs last on whatever reply wins.
+- `TurnTrace` gained `plan`, `revisions`, and `verdict` (`#[serde(default)]`, so
+  an old `traces.json` still loads), and `safety::INTERNAL_TAGS` gained `<plan>`
+  so a reply echoing the new scaffolding is dropped.
+- Config knobs (env-overridable, defaults ON, `for_test` OFF):
+  `planner_enabled` (`AGENT_PLANNING_ENABLED`), `plan_min_words`
+  (`AGENT_PLAN_MIN_WORDS`, default 12), `plan_max_tokens` (`AGENT_PLAN_TOKENS`),
+  `max_revisions` (`AGENT_MAX_REVISIONS`, default 1), `evaluator_max_tokens`
+  (`AGENT_EVAL_TOKENS`).
+- Evals: `crates/megumi-agent/tests/reasoning.rs` (a non-trivial request is
+  planned and the plan reaches the prompt; a short request is not planned; an
+  ACCEPT sends the draft unchanged; a REVISE rewrites it and the critique reaches
+  the revision call; a malformed verdict fails open; a `NO_REPLY` is never
+  evaluated; revisions are bounded; a reply echoing `<plan>` is dropped; the plan
+  and verdict calls read no memory and advertise no tools), plus unit tests in
+  `reasoning.rs` for the plan/verdict parsers.
+
+**Do not regress:** the two passes fail **open** — a plan or a verdict that
+cannot be read changes nothing, so reasoning can never suppress a reply the agent
+would otherwise send. Planning and evaluation run only on the ordinary path, so
+the confirmation narration turn is untouched, and the output guard still runs
+last. The plan and verdict calls read no memory and take no `ReaderContext`, so
+there is no new privacy surface; the revision reuses the turn's own prompt and so
+carries exactly what the main turn already showed the same reader. The planner
+and evaluator must stay off in `AgentConfig::for_test()` — the tool and eval
+tests assert exact request counts, and a stray plan or verdict call would break
+them.
+
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
-2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,store}.rs` to
-   see the seams.
+2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,reasoning,store}.rs`
+   to see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Start milestone 8 (the planner/evaluator) — the next unfinished milestone.
+4. Start milestone 9 (consolidation, reflections, tuning) — the next unfinished
+   milestone.

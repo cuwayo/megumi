@@ -15,7 +15,7 @@ use megumi_agent::{
     ToolRegistry, TraceSink,
 };
 use megumi_whatsapp::agent::on_messages;
-use megumi_whatsapp::agent::tools::SetReminder;
+use megumi_whatsapp::agent::tools::{CancelReminder, ListReminders, SetReminder};
 use megumi_whatsapp::{Data, NewsStore, ReminderStore};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::types::events::{BatchOrigin, InboundMessage, MessageBatch};
@@ -49,9 +49,10 @@ fn data() -> Data {
     }
 }
 
-/// Builds `Data` whose agent has tools on and a `set_reminder` tool over a fresh
-/// reminder store, driven by a scripted model. Returns the store so a test can
-/// assert on what the tool wrote.
+/// Builds `Data` whose agent has tools on and the reminder tools
+/// (`set_reminder`, `list_reminders`, `cancel_reminder`) over a fresh reminder
+/// store, driven by a scripted model. Returns the store so a test can assert on
+/// what a tool wrote.
 fn data_with_reminders(replies: Vec<LlmResponse>) -> (Data, Arc<ReminderStore>) {
     let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
     let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
@@ -60,7 +61,11 @@ fn data_with_reminders(replies: Vec<LlmResponse>) -> (Data, Arc<ReminderStore>) 
     let llm = Arc::new(ScriptedLlm::new(replies));
     let mut config = AgentConfig::for_test();
     config.max_tool_iterations = 3;
-    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(SetReminder::new(Arc::clone(&reminders)))];
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SetReminder::new(Arc::clone(&reminders))),
+        Arc::new(ListReminders::new(Arc::clone(&reminders))),
+        Arc::new(CancelReminder::new(Arc::clone(&reminders))),
+    ];
     let agent = Arc::new(megumi_agent::Agent::new(
         store,
         memory,
@@ -285,4 +290,134 @@ async fn a_reminder_tool_call_is_held_then_writes_to_the_bot_store() {
     assert_eq!(traces.len(), 2);
     assert_eq!(traces[1].trigger, "confirmation");
     assert_eq!(traces[1].tool_calls[0].name, "set_reminder");
+}
+
+/// A scripted reply that calls `list_reminders`.
+fn list_reminders_call() -> LlmResponse {
+    LlmResponse {
+        tool_calls: vec![LlmToolCall {
+            id: "call_1".into(),
+            name: "list_reminders".into(),
+            arguments: "{}".into(),
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn the_list_reminders_tool_reads_the_turns_chat() {
+    // The model asks to list reminders; the result it is shown carries only the
+    // turn's own chat's reminder, so a group turn cannot see a DM's.
+    let (data, reminders) = data_with_reminders(vec![
+        list_reminders_call(),
+        text_reply("You asked to stretch."),
+    ]);
+    let client = client().await;
+    reminders
+        .add(
+            "62812@s.whatsapp.net",
+            Utc::now() + chrono::Duration::minutes(10),
+            "stretch",
+        )
+        .unwrap();
+    reminders
+        .add(
+            "99999@s.whatsapp.net",
+            Utc::now() + chrono::Duration::minutes(10),
+            "another chat",
+        )
+        .unwrap();
+
+    let ask = event(
+        "62812@s.whatsapp.net",
+        "62812@s.whatsapp.net",
+        "what did I ask you to remind me about?",
+        false,
+        false,
+    );
+    on_messages(&data, &client, &ask).await;
+
+    // The tool ran (read-only, so no confirmation), and its result — the chat's
+    // own reminder — was fed back to the model.
+    let trace = data.agent.traces().recent(1).unwrap().pop().unwrap();
+    assert_eq!(trace.tool_calls.len(), 1);
+    assert_eq!(trace.tool_calls[0].name, "list_reminders");
+    assert!(trace.tool_calls[0].result.contains("stretch"));
+    assert!(!trace.tool_calls[0].result.contains("another chat"));
+}
+
+/// A scripted reply that calls `cancel_reminder` with `id`.
+fn cancel_reminder_call(id: &str) -> LlmResponse {
+    LlmResponse {
+        tool_calls: vec![LlmToolCall {
+            id: "call_1".into(),
+            name: "cancel_reminder".into(),
+            arguments: format!(r#"{{"id":"{id}"}}"#),
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_tool_call_is_held_then_removes_the_reminder() {
+    // The second state-changing tool: the model asks to cancel, the agent holds
+    // the call (the reminder survives), and only the user's "yes" removes it.
+    let chat = "62812@s.whatsapp.net";
+    // Set the reminder first, so the scripted call can name its real id.
+    let reminders = Arc::new(ReminderStore::open(":memory:").unwrap());
+    let existing = reminders
+        .add(chat, Utc::now() + chrono::Duration::minutes(10), "stretch")
+        .unwrap();
+    let prefix: String = existing.id.chars().take(8).collect();
+
+    let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
+    let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
+    let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
+    let llm = Arc::new(ScriptedLlm::new(vec![
+        cancel_reminder_call(&prefix),
+        text_reply("Okay, cancelled."),
+    ]));
+    let mut config = AgentConfig::for_test();
+    config.max_tool_iterations = 3;
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SetReminder::new(Arc::clone(&reminders))),
+        Arc::new(ListReminders::new(Arc::clone(&reminders))),
+        Arc::new(CancelReminder::new(Arc::clone(&reminders))),
+    ];
+    let data = Data {
+        started: Instant::now(),
+        news: Arc::new(NewsStore::open(":memory:").unwrap()),
+        news_task: tokio::sync::Mutex::new(None),
+        reminders: Arc::clone(&reminders),
+        remind_task: tokio::sync::Mutex::new(None),
+        agent: Arc::new(megumi_agent::Agent::new(
+            store,
+            memory,
+            traces,
+            llm,
+            Arc::new(ToolRegistry::new(tools)),
+            config,
+        )),
+        media: None,
+    };
+    let client = client().await;
+
+    let ask = event(chat, chat, "cancel my stretch reminder", false, false);
+    on_messages(&data, &client, &ask).await;
+
+    // Held, not run: the reminder is still there and the chat got the question.
+    assert_eq!(reminders.list(chat).unwrap().len(), 1);
+
+    // The user agrees; the tool runs and removes the reminder.
+    let yes = event(chat, chat, "yes", false, false);
+    on_messages(&data, &client, &yes).await;
+
+    assert!(
+        reminders.list(chat).unwrap().is_empty(),
+        "the confirmed cancel must remove the reminder"
+    );
+    let traces = data.agent.traces().recent(10).unwrap();
+    assert_eq!(traces.len(), 2);
+    assert_eq!(traces[1].trigger, "confirmation");
+    assert_eq!(traces[1].tool_calls[0].name, "cancel_reminder");
 }

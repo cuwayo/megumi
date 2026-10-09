@@ -148,8 +148,17 @@ fn build_agent(reminders: Arc<ReminderStore>) -> Arc<megumi_agent::Agent> {
         )),
     ];
     // `set_reminder` writes to the bot's reminder store, and is state-changing,
-    // so the agent holds its calls for a confirmation.
-    tools.push(Arc::new(agent::tools::SetReminder::new(reminders)));
+    // so the agent holds its calls for a confirmation. `list_reminders` reads
+    // the same store, and `cancel_reminder` writes to it behind the same gate —
+    // all three scoped to the turn's chat, so a group turn cannot see or cancel
+    // a private chat's reminders.
+    tools.push(Arc::new(agent::tools::SetReminder::new(Arc::clone(
+        &reminders,
+    ))));
+    tools.push(Arc::new(agent::tools::ListReminders::new(Arc::clone(
+        &reminders,
+    ))));
+    tools.push(Arc::new(agent::tools::CancelReminder::new(reminders)));
     // Web search is optional: without `TAVILY_API_KEY` the tool is simply absent.
     if let Some(web_search) = megumi_agent::WebSearch::from_env(&config) {
         tools.push(Arc::new(web_search));

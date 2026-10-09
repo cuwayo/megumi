@@ -415,7 +415,12 @@ pub(crate) fn attachment_note(attachments: &[Attachment]) -> String {
 }
 
 /// Escapes the characters that could close a trust tag early.
-pub(crate) fn escape(text: &str) -> String {
+///
+/// Public because a bot-side tool that renders stored text back to the model —
+/// a reminder's own words, say — must escape it the same way the prompt does, or
+/// the text could smuggle a tag the model then echoes into a reply the output
+/// guard would drop.
+pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {

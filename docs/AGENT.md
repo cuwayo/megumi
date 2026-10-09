@@ -27,6 +27,7 @@ milestone until the earlier one's exit criteria pass.**
 | 11. Tool context + the first consequential tool | **done** (`ToolContext`; `search_memory` as a real tool; `set_reminder` behind the confirmation gate) |
 | 12. Grounding — the agent gets a clock | **done** (a `<now>` prompt layer from the trigger's timestamp; guard drops an echoed one) |
 | 13. History search — the model can reach past the prompt window | **done** (`search_history` over the message store, scoped to the turn's chat) |
+| 14. Reminder management — the model can see and cancel reminders | **done** (`list_reminders` + `cancel_reminder` over the bot's reminder store, the second behind the confirmation gate) |
 
 ### Where things live
 
@@ -48,9 +49,10 @@ milestone until the earlier one's exit criteria pass.**
   shared core both a live message and a command's `MessageContext` go through.
 - `src/agent/media.rs` — the optional OpenAI-compatible media provider the
   adapter transcribes voice notes and describes images with (milestone 10).
-- `src/agent/tools.rs` — the bot-side tools that need one of the bot's stores;
-  `SetReminder` schedules into the reminder store and is held for a confirmation
-  (milestone 11).
+- `src/agent/tools.rs` — the bot-side tools that need one of the bot's stores,
+  all over the reminder store: `SetReminder` schedules into it (milestone 11),
+  `ListReminders` reads it, and `CancelReminder` writes to it behind the same
+  confirmation gate (milestone 14).
 - `src/commands/{ask,summary,memory,forget,remind}/` — the assistant commands
   (the `assistant` group), the deterministic entry points to the agent.
 - `src/reminders/` — `!remind`'s store, duration parser, and scheduler loop
@@ -59,7 +61,8 @@ milestone until the earlier one's exit criteria pass.**
   digest, the reminders, and the agent.
 - `crates/megumi-agent/tests/{pipeline,eval,memory,tools,history,injection,router,reasoning,reflection,media,live}.rs` —
   end-to-end, eval, memory, tool-loop, history-search, prompt-injection,
-  reasoning, reflection, media, and live smoke tests.
+  reasoning, reflection, media, and live smoke tests. The bot-side reminder
+  tools' flows are in the bot crate's `tests/agent.rs`.
 
 ## Decisions that must not regress
 
@@ -592,15 +595,60 @@ and adds no state-changing surface. Its results are untagged plain lines, so a
 tool result cannot smuggle the prompt's internal tags into a reply the output
 guard would then drop.
 
+## Milestone 14 — reminder management (done)
+
+Goal: let the model *manage* the reminders it can already create. Milestone 11
+gave it `set_reminder`, but a reminder it set was then invisible to it — "what
+did I ask you to remind me about?" and "cancel that" both failed, because the
+model had no way to read or remove one. Built in `src/agent/tools.rs`, on the
+`SetReminder` template:
+
+- **`ListReminders`** (`list_reminders`) — read-only, no arguments. On a call it
+  reads `store.list(context.chat())` and renders the chat's reminders as plain
+  escaped lines, each `` - {short id}: {text} (due {rfc3339}) ``, or
+  `No reminders are set in this chat.` when there are none. It leaves
+  `Tool::confirmation` at its `None` default.
+- **`CancelReminder`** (`cancel_reminder`) — state-changing, so it overrides
+  `Tool::confirmation` and the agent **holds** the call until the user agrees,
+  exactly as `set_reminder` does. On a call it removes the reminder whose id
+  starts with the model's `id`, **in the turn's chat** (`store.cancel(context.chat(), …)`);
+  an unknown id or an ambiguous prefix is an error result handed back to the
+  model, not a failed turn.
+- **Rendering is untagged and escaped**, like every tool result: the reminder's
+  text is the *user's* words, so it could carry a trust tag; `escape` (promoted
+  to `pub` in `context.rs`, so a bot-side tool escapes exactly as the prompt
+  does) renders it inert, and the line carries no internal tag the model could
+  echo into a reply the output guard would drop. The id is the same eight-character
+  short form `!remind` shows, so the model and the user name a reminder the same way.
+- `build_agent` registers both tools over the same `ReminderStore` it already
+  gives `SetReminder`.
+- Evals: the two new flows through the production wiring in `tests/agent.rs` (the
+  list tool reads the turn's own chat and its result reaches the model; a cancel
+  call is held — the reminder survives — and the user's "yes" removes it, traced
+  as a confirmation turn), plus unit tests in `src/agent/tools.rs` (the specs,
+  the confirmation questions, chat scoping, the empty case, escaping, an unknown
+  id, and a missing id).
+
+**Do not regress:** both tools read and write only `context.chat()`, so the
+per-chat scoping the store enforces holds on the tool path — a group turn cannot
+see or cancel a private chat's or another group's reminders. `cancel_reminder` is
+state-changing, so it is **never** run on the model's word: the agent holds the
+call and runs it in a separate turn only after a directed yes, the same gate
+`set_reminder` uses. A tool result is untagged plain lines with the user's text
+escaped, so it cannot smuggle a trust tag into a reply.
+
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
 2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,reasoning,store}.rs`
    to see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Milestones 1–13 are done. The original design spec is not in the repo, so any
-   further work is a new interpretation: add more bot-side tools (a `set_reminder`
-   is the template — a store the bot owns, plus a `confirmation` when it changes
-   state), extend the evals, tune the reflection, retrieval, and media knobs
-   against real traffic, or add video/document understanding to the adapter's
-   `media` seam.
+4. Milestones 1–14 are done. The original design spec is not in the repo, so any
+   further work is a new interpretation: add more bot-side tools (the reminder
+   tools are the template — a store the bot owns, a read-only tool, and a
+   `confirmation` on each that changes state), extend the evals, tune the
+   reflection, retrieval, and media knobs against real traffic, or add
+   video/document understanding to the adapter's `media` seam. A tool over the
+   *news* store (subscribe/unsubscribe from a turn) would mirror this milestone,
+   but the news subscription is a group-admin setting today, so it would need a
+   permission check the agent's `ToolContext` does not yet carry.

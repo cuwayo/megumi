@@ -214,7 +214,8 @@ hook is set, the framework subscribes to every event kind, not just `Messages`; 
 `megumi_agent::InboundEvent`s and sending the `OutboundAction`s back; `src/agent/media.rs` is the optional
 OpenAI-compatible provider that transcribes a voice note or describes an image before the event is built
 (the adapter, not the core, reads media — milestone 10); `src/agent/tools.rs` holds the bot-side tools that
-need one of the bot's own stores (`SetReminder` writes to the reminder store — milestone 11). The pipeline is: store every message →
+need one of the bot's own stores, all over the reminder store: `SetReminder` writes to it, `ListReminders`
+reads it, and `CancelReminder` removes from it behind the confirmation gate (milestones 11 and 14). The pipeline is: store every message →
 gate (whether to speak) → build a budgeted, trust-tagged prompt → call the model, running any tool calls →
 record a trace. Modules:
 `event` (types), `config` (`AgentConfig`), `store` (per-chat JSON history, one file per chat, bounded
@@ -251,7 +252,7 @@ sendable: it drops an empty/`NO_REPLY` reply, one carrying the prompt's own trus
 system prompt, then truncates to `max_reply_chars`. `Tool::confirmation` returns the question to ask before
 a state-changing tool runs; the agent **holds** such a call, asks the chat, and runs it only in a separate
 turn after the user's "yes" (`PendingConfirmations`, per chat, in memory, expiring after
-`confirmation_ttl`). The bot's `SetReminder` is the first production tool to use this gate. `run_turn` takes an optional seed so that confirmation turn reuses the same loop, trace,
+`confirmation_ttl`). The bot's `SetReminder` and `CancelReminder` are the production tools that use this gate. `run_turn` takes an optional seed so that confirmation turn reuses the same loop, trace,
 and guard. The confirmation answer is resolved *before* `gate::decide`, so a private "ok" is not swallowed
 as an acknowledgement — and in a group only a message directed at the bot (mention or reply) can answer it.
 

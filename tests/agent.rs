@@ -12,7 +12,7 @@ use std::time::Instant;
 use chrono::Utc;
 use megumi_agent::{AgentConfig, MemoryStore, MessageStore, ScriptedLlm, ToolRegistry, TraceSink};
 use megumi_whatsapp::agent::on_messages;
-use megumi_whatsapp::{Data, NewsStore};
+use megumi_whatsapp::{Data, NewsStore, ReminderStore};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::types::events::{BatchOrigin, InboundMessage, MessageBatch};
 use whatsapp_rust::types::message::{MessageInfo, MessageSource};
@@ -38,6 +38,8 @@ fn data() -> Data {
         started: Instant::now(),
         news: Arc::new(NewsStore::open(":memory:").unwrap()),
         news_task: tokio::sync::Mutex::new(None),
+        reminders: Arc::new(ReminderStore::open(":memory:").unwrap()),
+        remind_task: tokio::sync::Mutex::new(None),
         agent,
     }
 }
@@ -164,4 +166,26 @@ async fn a_command_is_stored_but_not_answered() {
     let chat = megumi_agent::ChatId::new("120363@g.us");
     assert_eq!(data.agent.store().recent(&chat, 10).unwrap().len(), 1);
     assert!(data.agent.traces().recent(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_commands_event_matches_the_adapters() {
+    // `event_from_context` and `inbound_event` must produce the same id, chat,
+    // and sender, or the command's stored event and the adapter's ingest of the
+    // same message would not deduplicate.
+    let client = client().await;
+    let batch = event("120363@g.us", "62812@s.whatsapp.net", "!ask hi", true, true);
+    let inbound = batch.iter().next().expect("one message");
+
+    let own: Vec<Jid> = [client.pn(), client.lid()].into_iter().flatten().collect();
+    let from_inbound = megumi_whatsapp::agent::inbound_event(inbound, &own, &client).await;
+
+    let context = whatsapp_rust::bot::MessageContext::from_inbound(inbound, Arc::clone(&client));
+    let from_context = megumi_whatsapp::agent::event_from_context(&context).await;
+
+    assert_eq!(from_inbound.message_id, from_context.message_id);
+    assert_eq!(from_inbound.chat, from_context.chat);
+    assert_eq!(from_inbound.sender, from_context.sender);
+    assert_eq!(from_inbound.is_command, from_context.is_command);
+    assert!(from_context.is_command);
 }

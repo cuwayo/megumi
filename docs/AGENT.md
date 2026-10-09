@@ -20,7 +20,7 @@ milestone until the earlier one's exit criteria pass.**
 | 4. Semantic memory (writer, retrieval, validity windows) | **done** |
 | 5. Tool loop | **done** (`search_memory`, `web_search`) |
 | 6. Safety layer (output guard, confirmation gates, injection suite) | **done** |
-| 7. Commands + rate limits (the deterministic command router) | not started |
+| 7. Commands + rate limits (the deterministic command router) | **done** (`!ask`, `!summary`, `!memory`, `!forget`, `!remind`) |
 | 8. Planner/evaluator | not started |
 | 9. Consolidation, reflections, tuning | not started |
 
@@ -36,10 +36,15 @@ milestone until the earlier one's exit criteria pass.**
 - `crates/megumi-agent/src/safety.rs` — the output guard, the confirmation gate,
   and the pending-confirmation store.
 - `src/agent/mod.rs` — the WhatsApp adapter (`InboundMessage` → `InboundEvent`,
-  mention/reply/identity detection, sending actions).
+  mention/reply/identity detection, sending actions). `event_from_parts` is the
+  shared core both a live message and a command's `MessageContext` go through.
+- `src/commands/{ask,summary,memory,forget,remind}/` — the assistant commands
+  (the `assistant` group), the deterministic entry points to the agent.
+- `src/reminders/` — `!remind`'s store, duration parser, and scheduler loop
+  (mirrors `src/news/`).
 - `src/events.rs` — the single framework `event_handler`, fanning out to the news
-  digest and the agent.
-- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,live}.rs` —
+  digest, the reminders, and the agent.
+- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,router,live}.rs` —
   end-to-end, eval, memory, tool-loop, prompt-injection, and live smoke tests.
 
 ## Decisions that must not regress
@@ -216,15 +221,58 @@ directed at the bot (mention or reply) can answer it. With no consequential tool
 registered and no pending call, the gate and `NO_REPLY` behaviour are exactly as
 before.
 
-## Milestone 7 — the command router (note)
+## Milestone 7 — the command router (done)
 
-The agent has **no `!` command today**; it is trigger-based (mention, reply,
-DM). The spec's `/ask`, `/summary`, `/remind`, `/memory`, `/forget`, `/help`
-commands are milestone 7, after memory and tools exist. If a command is wanted
-sooner, the pattern is: a `#[command]` that builds an `InboundEvent` from the
-command message and calls `ctx.data().agent.respond(...)`, then sends the result.
-Keep simple commands (`/help`, `/memory`, `/forget`) as plain code with no model
-call.
+Goal: a deterministic entry point to the agent, so its memory and answers are
+reachable without relying on the model to decide to speak, plus the framework's
+own rate limits on the model-backed commands. Built as an `assistant` command
+group in `src/commands/{ask,summary,memory,forget,remind}/`, with two new agent
+seams and a reminder subsystem:
+
+- **`!ask <question>`** (`user_cooldown = 5`) — forces an agent turn. A command
+  message is `is_command`, so `gate::decide` stays silent on it by design;
+  `Agent::answer_command` is the seam that skips the gate and runs the turn
+  directly, labelled `Trigger::Command`, mirroring how `confirm_turn` calls
+  `run_turn`. The command builds an event from its `MessageContext` (via the
+  adapter's `event_from_context`), **keeps the original message id**, overrides
+  the text with the question and `is_command = false`, and stores it before the
+  turn — so the model sees the question, and the adapter's later ingest of the
+  raw `!ask …` is a no-op by id.
+- **`!summary`** (`channel_cooldown = 30`) — `Agent::summarize` makes one model
+  call shaped like the memory writer's extraction pass (no tools, not a turn),
+  screens the reply with the output guard, and stores it with
+  `MessageStore::set_summary` — which finally feeds the context builder's
+  `<conversation_summary>` layer.
+- **`!memory`** / **`!forget <id|all>`** — plain code, no model call.
+  `Agent::list_memory` and `Agent::forget_memory` take the per-chat lock and go
+  through `ReaderContext`, so a listing never shows another chat's fact and a
+  forget cannot reach one. `retrieval::list` filters by `reader.permits` first,
+  keeps only this chat's still-true, non-forgotten facts, and returns the full
+  `MemoryRecord`s so the ids are shown.
+- **`!remind set <duration> <text>`** with `list` and `cancel <id>` — a persisted
+  schedule in `src/reminders/`, mirroring `src/news/`: a JSON store, a duration
+  parser (`10m`, `1h30m`, `2d`), and a loop started on `Connected` / stopped on
+  `Disconnected` with the same reconnect discipline. `!remind` is structured like
+  `!group`: a `subcommand_required` parent whose body never runs, so a bare
+  `!remind` tells you it needs a subcommand and every child holds its own logic.
+- Evals: `crates/megumi-agent/tests/router.rs` (a command forces a turn the gate
+  would refuse; the question reaches the prompt; a summary reaches the next
+  turn's summary layer; listing and forgetting respect the chat and the reader;
+  a forgotten fact is unreachable even for a past-cue question), `tests/routing.rs`
+  (the group is registered and the model-backed commands carry cooldowns), and
+  `tests/reminders.rs`.
+
+**Do not regress:** a command never answers through `gate::decide` — it forces
+its own turn through `answer_command`, which keeps the gate's silence on commands
+intact for the trigger path. The command stores its event under the **original
+message id** before the turn, so the question is in the window exactly once and
+the adapter's ingest deduplicates. Plain commands do no model work and take the
+per-chat lock, so they cannot race an extraction pass. **`!forget` is a
+never-recall flag, not `Invalidate`:** `Invalidate` closes a window but leaves a
+fact answerable as history, and retrieval re-includes superseded facts for
+past-cue questions, so `MemoryOp::Forget` sets `MemoryRecord::forgotten` and
+retrieval drops forgotten records in both current and past modes. Reminders are
+per chat, so a DM cannot list or cancel another chat's.
 
 ## First steps in a new session
 
@@ -232,4 +280,4 @@ call.
 2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,store}.rs` to
    see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Start milestone 7 (the command router) — the next unfinished milestone.
+4. Start milestone 8 (the planner/evaluator) — the next unfinished milestone.

@@ -116,3 +116,43 @@ fn uptime_is_registered() {
     let help = framework().command_help(name).unwrap();
     assert!(help.contains("!uptime"), "{help}");
 }
+
+#[test]
+fn the_assistant_commands_are_registered_and_grouped() {
+    let framework = framework();
+    let help = framework.help_text();
+    assert!(help.contains("Assistant"), "{help}");
+    for name in ["ask", "summary", "memory", "forget", "remind"] {
+        assert!(
+            framework.command_help(name).is_some(),
+            "`{name}` is not registered"
+        );
+    }
+    // The subcommands resolve under their parent.
+    for path in ["remind set", "remind list", "remind cancel"] {
+        assert!(
+            framework.command_help(path).is_some(),
+            "`{path}` is not registered"
+        );
+    }
+    // Like `!group`, the parent is a table of contents: a bare `!remind` needs a
+    // subcommand, and the parent body never runs.
+    assert!(commands::remind().into_command().subcommand_required);
+}
+
+#[test]
+fn the_model_backed_assistant_commands_carry_cooldowns() {
+    let ask = commands::ask().into_command();
+    assert_eq!(
+        ask.cooldown_config.user,
+        Some(std::time::Duration::from_secs(5))
+    );
+    let summary = commands::summary().into_command();
+    assert_eq!(
+        summary.cooldown_config.channel,
+        Some(std::time::Duration::from_secs(30))
+    );
+    // The plain commands do no model work, so they carry no cooldown.
+    assert!(commands::memory().into_command().cooldown_config.is_empty());
+    assert!(commands::forget().into_command().cooldown_config.is_empty());
+}

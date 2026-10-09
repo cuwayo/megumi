@@ -92,6 +92,33 @@ the video the address points at.
 more WhatsApp packs of at most 60 stickers each. An optional second argument
 names the pack. This path needs `TELEGRAM_BOT_TOKEN` in `.env`.
 
+### Assistant
+
+With `ANTHROPIC_API_KEY` set, these commands reach the AI agent directly, without
+waiting for it to be mentioned.
+
+| Command | Aliases | What it does |
+| --- | --- | --- |
+| `!ask <question>` | `q` | Asks the assistant a question and replies with its answer |
+| `!summary` | `summarise`, `summarize` | Summarises the conversation so far |
+| `!memory` | `memories`, `mem` | Lists the facts the assistant has stored for this chat |
+| `!forget <id\|all>` | `unremember` | Forgets a stored fact, or everything with `all` |
+| `!remind set <when> <what>` | `reminder` | Sets a reminder; `!remind list` shows them, `!remind cancel <id>` removes one |
+
+A bare `!remind` tells you it needs a subcommand, the same as `!group`.
+
+`!ask` answers with the same context, memory, and tools a mention or a direct
+message would get. `!summary` writes a short summary and stores it, so later
+answers keep the gist of older conversation. `!memory` shows each fact with a
+short id, and `!forget` takes that id — or `all` to clear the chat's memory. A
+forgotten fact is never recalled again, not even by a question about the past.
+`!ask` and `!summary` are rate-limited (5 seconds per user, 30 seconds per chat).
+
+`!remind set` takes a delay and what to say: `!remind set 10m take a break`,
+`!remind set 1h30m call mum`, `!remind set 2d renew the lease`. Units are `s`,
+`m`, `h`, and `d`, and a bare number is minutes. Reminders are remembered across
+restarts and are private to the chat they were set in.
+
 ### Group administration
 
 `!group` and all of its subcommands work only in groups, and only for group

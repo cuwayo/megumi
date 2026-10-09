@@ -13,9 +13,11 @@ pub mod commands;
 mod data;
 pub mod events;
 pub mod news;
+pub mod reminders;
 
 pub use data::Data;
 pub use news::store::NewsStore;
+pub use reminders::store::ReminderStore;
 
 /// The context every command takes: the framework's [`Context`](megumi::Context)
 /// carrying the bot's [`Data`].
@@ -44,18 +46,32 @@ pub fn framework() -> Framework<Data> {
     // startup rather than on the first message — `setup` runs lazily, so a panic
     // there would leave the bot alive but unable to answer anything.
     let news = Arc::new(NewsStore::open(path).unwrap_or_else(|error| panic!("{error}")));
+    // `REMINDER_DB` overrides the default of `reminders.json`; tests get an
+    // in-memory store instead of one on disk.
+    let reminder_path = std::env::var("REMINDER_DB").unwrap_or_else(|_| {
+        if cfg!(test) {
+            ":memory:".to_string()
+        } else {
+            "reminders.json".to_string()
+        }
+    });
+    let reminders =
+        Arc::new(ReminderStore::open(reminder_path).unwrap_or_else(|error| panic!("{error}")));
     let started = Instant::now();
     let agent = build_agent();
 
     Framework::builder()
         .setup(move |_client| {
             let news = Arc::clone(&news);
+            let reminders = Arc::clone(&reminders);
             let agent = Arc::clone(&agent);
             async move {
                 Ok(Data {
                     started,
                     news,
                     news_task: tokio::sync::Mutex::new(None),
+                    reminders,
+                    remind_task: tokio::sync::Mutex::new(None),
                     agent,
                 })
             }
@@ -67,6 +83,7 @@ pub fn framework() -> Framework<Data> {
             commands::media(),
             commands::admin(),
             commands::owner(),
+            commands::assistant(),
         ])
         .build()
 }

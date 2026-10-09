@@ -79,6 +79,25 @@ pub struct RecalledMemory {
 }
 
 impl ReaderContext {
+    /// The reader a turn triggered by `event` reads as.
+    ///
+    /// A group turn's reader is a member of that group only. A private turn's
+    /// reader is the person, and the groups they are known to be in are not yet
+    /// threaded through — the adapter will supply them when it can, so for now a
+    /// private reader sees their private memories and nothing group-scoped.
+    pub fn for_event(event: &InboundEvent) -> Self {
+        let member_of = match event.chat_type {
+            ChatType::Group => vec![event.chat.clone()],
+            ChatType::Private => Vec::new(),
+        };
+        Self {
+            chat: event.chat.clone(),
+            chat_type: event.chat_type,
+            requester: event.sender.clone(),
+            member_of,
+        }
+    }
+
     /// Whether this reader may see `memory`.
     ///
     /// The `match` is exhaustive on purpose: adding a [`Visibility`] variant

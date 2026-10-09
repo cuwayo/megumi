@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::news::store::NewsStore;
+use crate::reminders::store::ReminderStore;
 
 /// The state every command shares, built once by the framework's async `setup`.
 ///
@@ -22,6 +23,13 @@ pub struct Data {
     /// every reconnect, and the loop runs forever, so without this each
     /// reconnect would leave another loop running beside the new one.
     pub news_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The reminders each chat has set. Shared with the scheduler, which holds
+    /// the same store the commands reach through `ctx.data().reminders`.
+    pub reminders: Arc<ReminderStore>,
+    /// The reminder loop the current connection started, kept for the same
+    /// reason as [`news_task`](Self::news_task): a reconnect stops the old loop
+    /// before starting its replacement.
+    pub remind_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The AI agent: its message store, trace log, model client, and per-chat
     /// queues. Built at framework-build time so a corrupt store fails startup
     /// rather than the first message; the agent never needs the connected

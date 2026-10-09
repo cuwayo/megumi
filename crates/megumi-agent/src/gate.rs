@@ -23,6 +23,13 @@ pub enum Trigger {
     /// Not produced by [`decide`]: it is the reason the agent spoke when it
     /// resolved a held tool call, so it appears only in a turn's trace.
     Confirmation,
+    /// A command forced the agent to speak.
+    ///
+    /// Not produced by [`decide`]: a command is left to the command layer, so
+    /// [`decide`] stays silent on it. The command router runs the turn itself
+    /// and labels it with this, so the trace distinguishes a command-driven
+    /// turn from a mention or a DM.
+    Command,
 }
 
 /// Why the agent stayed silent.

@@ -2,9 +2,9 @@
 //! subsystems that each want a different slice of it.
 //!
 //! The framework allows exactly one [`EventHook`](megumi::EventHook), but the
-//! news digest and the agent both need one. This is that one hook: it rebuilds
-//! the [`FrameworkContext`](megumi::FrameworkContext) for each consumer — its
-//! fields are public — and runs them in turn.
+//! news digest, the reminder scheduler, and the agent all need one. This is that
+//! one hook: it rebuilds the [`FrameworkContext`](megumi::FrameworkContext) for
+//! each consumer — its fields are public — and runs them in turn.
 
 use std::sync::Arc;
 
@@ -13,11 +13,12 @@ use tracing::error;
 
 use crate::data::Data;
 
-/// Fans every event out to the news digest and the agent.
+/// Fans every event out to the news digest, the reminders, and the agent.
 ///
-/// News runs first, and a failure there is logged here rather than returned, so
-/// an agent problem can never stop the digest loop from starting. The agent
-/// only looks at `Event::Messages`; every other kind falls straight through.
+/// News and reminders run first, and a failure in either is logged here rather
+/// than returned, so one subsystem can never stop another from running. The
+/// agent only looks at `Event::Messages`; every other kind falls straight
+/// through.
 pub fn event_handler(
     ctx: FrameworkContext<Data>,
     event: Arc<Event>,
@@ -33,6 +34,18 @@ pub fn event_handler(
         .await
         {
             error!(%error, "the news event handler failed");
+        }
+
+        if let Err(error) = crate::reminders::event_handler(
+            FrameworkContext {
+                client: Arc::clone(&ctx.client),
+                data: Arc::clone(&ctx.data),
+            },
+            Arc::clone(&event),
+        )
+        .await
+        {
+            error!(%error, "the reminder event handler failed");
         }
 
         if let Some(batch) = event.as_messages() {

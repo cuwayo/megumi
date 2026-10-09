@@ -1,23 +1,33 @@
+pub mod ask;
 pub mod console;
 pub mod download;
 pub mod echo;
+pub mod forget;
 pub mod group;
 pub mod help;
+pub mod memory;
 pub mod ping;
+pub mod remind;
 pub mod scihub;
 pub mod shazam;
 pub mod sticker;
+pub mod summary;
 pub mod uptime;
 
+pub use ask::ask;
 pub use console::console;
 pub use download::download;
 pub use echo::echo;
+pub use forget::forget;
 pub use group::group;
 pub use help::help;
+pub use memory::memory;
 pub use ping::ping;
+pub use remind::remind;
 pub use scihub::scihub;
 pub use shazam::shazam;
 pub use sticker::sticker;
+pub use summary::summary;
 pub use uptime::uptime;
 
 use megumi::group;
@@ -66,3 +76,17 @@ pub mod admin {}
     commands(crate::commands::console)
 )]
 pub mod owner {}
+
+/// The deterministic entry points to the AI agent.
+#[group(
+    description = "Assistant",
+    context = crate::Context,
+    commands(
+        crate::commands::ask,
+        crate::commands::summary,
+        crate::commands::memory,
+        crate::commands::forget,
+        crate::commands::remind,
+    )
+)]
+pub mod assistant {}

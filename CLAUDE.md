@@ -151,7 +151,7 @@ inherits its parent's checks, permission, and chat-type restriction, so those ar
 
 ## The bot's commands
 
-`src/lib.rs::framework()` registers four `#[group]`s defined in `src/commands/mod.rs`, which is what `!help`
+`src/lib.rs::framework()` registers five `#[group]`s defined in `src/commands/mod.rs`, which is what `!help`
 groups commands under. Each group's `context = crate::Context` is how the macro learns the bot's `Data` type.
 
 - `utility` — `help`, `ping`, `echo`, `uptime`, `scihub`. `!scihub` resolves a DOI (bare, `doi.org`, or
@@ -172,18 +172,35 @@ groups commands under. Each group's `context = crate::Context` is how the macro 
   task spawned when the client connects.
 - `owner` — `console` (alias `sh`), `permission = Owner` and `hide_in_help`. It runs the rest of the message
   under `sh -c` with a 10 s timeout and replies with the tail of the output.
+- `assistant` — `ask`, `summary`, `memory`, `forget`, `remind`. The deterministic entry points to the AI
+  agent. `!ask <question>` (`user_cooldown`) forces an agent turn even though a command is normally left to
+  the command layer: `Agent::answer_command` skips the gate and runs the turn labelled `Trigger::Command`.
+  The command builds its event from the `MessageContext` via `src/agent::event_from_context` (the same
+  `event_from_parts` core a live message goes through), keeps the original message id, stores the question,
+  and runs the turn — so the adapter's later ingest of the raw `!ask …` deduplicates and the question appears
+  in the window once. `!summary` (`channel_cooldown`) makes one model call (`Agent::summarize`), screens the
+  reply, and stores it as the chat's rolling summary. `!memory` and `!forget` are plain code — no model call
+  — through `Agent::list_memory`/`Agent::forget_memory`, which take the per-chat lock and the reader's
+  privacy boundary. `!forget` is a never-recall flag (`MemoryOp::Forget` sets `MemoryRecord::forgotten`;
+  retrieval drops forgotten facts in both current and past modes), not `Invalidate`, which would leave the
+  fact answerable as history. `!remind set <duration> <text>` (with `list` and `cancel <id>`) persists
+  to `src/reminders/`, which mirrors `src/news/`: a JSON store, a duration parser, and a loop started on
+  `Connected` / stopped on `Disconnected`. `!remind` follows the `!group` shape: a `subcommand_required`
+  parent whose body never runs, with all logic in its children.
 
 `Data` (in `src/data.rs`) holds the process start time, pinned in `framework()` so `!uptime` measures the
-whole run, the news subscription store, the handle to the running digest task, and the AI agent. The start
-time is pinned at build time (outside the async `setup` closure) so it still precedes the first command; the
-agent is also built at build time (so a corrupt store fails startup), while the rest is built inside `setup`.
-The digest loop is started by `src/news::event_handler` on the `Connected` event — `main` no longer wires
-`on_connected` itself.
+whole run, the news subscription store, the handle to the running digest task, the reminder store and its
+task handle, and the AI agent. The start time is pinned at build time (outside the async `setup` closure) so
+it still precedes the first command; the agent and the reminder store are also built at build time (so a
+corrupt store fails startup), while the rest is built inside `setup`. The digest loop is started by
+`src/news::event_handler` and the reminder loop by `src/reminders::event_handler`, both on the `Connected`
+event — `main` no longer wires `on_connected` itself.
 
-The framework allows only one `event_handler`, and both the news digest and the agent need one, so
-`src/events.rs::event_handler` is the single hook: it rebuilds the `FrameworkContext` for each consumer (its
-fields are public) and runs the news handler, then the agent. Because a hook is set, the framework subscribes
-to every event kind, not just `Messages`; the agent guards on `event.as_messages()` and ignores the rest.
+The framework allows only one `event_handler`, and the news digest, the reminders, and the agent all need
+one, so `src/events.rs::event_handler` is the single hook: it rebuilds the `FrameworkContext` for each
+consumer (its fields are public) and runs the news handler, then the reminders, then the agent. Because a
+hook is set, the framework subscribes to every event kind, not just `Messages`; the agent guards on
+`event.as_messages()` and ignores the rest.
 
 ## The AI agent
 

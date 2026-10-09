@@ -13,6 +13,9 @@ whatsapp.db*
 # Which groups subscribed to the morning digest, and which mornings went out.
 news.json*
 
+# The reminders each chat has set.
+reminders.json*
+
 # The agent's per-chat history and its turn log.
 agent/
 

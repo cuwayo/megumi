@@ -23,6 +23,21 @@ pub struct AgentConfig {
     pub max_context_tokens: usize,
     /// The most tokens the model may produce in one reply.
     pub max_reply_tokens: u32,
+    /// The most tokens a `!summary` reply may use.
+    ///
+    /// A summary is shorter than a reply, so it has its own, smaller cap.
+    pub summary_max_tokens: u32,
+    /// The most characters of a summary the output guard will keep.
+    ///
+    /// A backstop under the token cap: a summary longer than this is truncated
+    /// before it is stored or sent.
+    pub summary_max_chars: usize,
+    /// How many facts `!memory` lists.
+    ///
+    /// A cap on the listing, not on what may be forgotten: `!forget` matches
+    /// against every fact the chat holds, so a truncated listing cannot hide a
+    /// fact from a forget.
+    pub memory_list_top: usize,
     /// The most characters of a reply the output guard will send.
     ///
     /// A backstop under the token cap: a reply longer than this is truncated
@@ -79,6 +94,9 @@ impl Default for AgentConfig {
             private_window: 40,
             max_context_tokens: 6_000,
             max_reply_tokens: 1_024,
+            summary_max_tokens: 512,
+            summary_max_chars: 2_000,
+            memory_list_top: 20,
             max_reply_chars: 4_000,
             confirmation_ttl: Duration::from_secs(300),
             model: "claude-sonnet-5-5".to_string(),
@@ -118,6 +136,12 @@ impl AgentConfig {
                 .map(|tokens| tokens as u32)
                 .unwrap_or(default.max_reply_tokens),
             max_reply_chars: env_usize("AGENT_MAX_REPLY_CHARS").unwrap_or(default.max_reply_chars),
+            summary_max_tokens: env_usize("AGENT_SUMMARY_TOKENS")
+                .map(|tokens| tokens as u32)
+                .unwrap_or(default.summary_max_tokens),
+            summary_max_chars: env_usize("AGENT_SUMMARY_MAX_CHARS")
+                .unwrap_or(default.summary_max_chars),
+            memory_list_top: env_usize("AGENT_MEMORY_LIST_TOP").unwrap_or(default.memory_list_top),
             confirmation_ttl: env_usize("AGENT_CONFIRMATION_TTL")
                 .map(|secs| Duration::from_secs(secs as u64))
                 .unwrap_or(default.confirmation_ttl),

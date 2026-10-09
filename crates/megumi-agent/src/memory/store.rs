@@ -55,6 +55,15 @@ pub struct MemoryRecord {
     pub origin_chat: ChatId,
     /// The person the fact is about, when it is about someone.
     pub subject: Option<SenderId>,
+    /// Whether the fact was explicitly forgotten.
+    ///
+    /// A forgotten fact is never recalled — not even for a question about the
+    /// past — so this is distinct from `valid_to`, which closes a fact's window
+    /// but leaves it answerable as history. The record stays on disk (nothing is
+    /// deleted) with its provenance intact; only its recall is switched off.
+    /// Defaulted so a memory file written before the field existed still loads.
+    #[serde(default)]
+    pub forgotten: bool,
 }
 
 /// A fact the writer has validated and wants stored.
@@ -103,6 +112,16 @@ pub enum MemoryOp {
         target: String,
         /// When it stopped being true.
         valid_from: DateTime<Utc>,
+    },
+    /// Mark `target` forgotten, so it is never recalled again.
+    ///
+    /// Distinct from [`Invalidate`](Self::Invalidate): an invalidated fact is
+    /// still answerable as history for a question about the past, while a
+    /// forgotten one is not. Nothing is deleted — the record keeps its
+    /// provenance and only its recall is switched off.
+    Forget {
+        /// The id of the record to forget.
+        target: String,
     },
     /// Nothing worth keeping.
     Noop,
@@ -187,6 +206,13 @@ impl MemoryStore {
                         continue;
                     };
                     old.valid_to = Some(*valid_from);
+                    applied += 1;
+                }
+                MemoryOp::Forget { target } => {
+                    let Some(old) = updated.records.iter_mut().find(|r| r.id == *target) else {
+                        continue;
+                    };
+                    old.forgotten = true;
                     applied += 1;
                 }
             }
@@ -282,6 +308,7 @@ impl MemoryRecord {
             visibility: fact.visibility,
             origin_chat: chat.clone(),
             subject: fact.subject.clone(),
+            forgotten: false,
         }
     }
 }
@@ -402,6 +429,46 @@ mod tests {
             .unwrap();
         assert_eq!(applied, 1);
         assert_eq!(store.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_forget_flags_the_record_without_closing_its_window() {
+        let store = MemoryStore::open(":memory:").unwrap();
+        let chat = ChatId::new("gA");
+        store
+            .apply(&chat, &[MemoryOp::Add(fact("a fact"))], None)
+            .unwrap();
+        let id = store.records().unwrap()[0].id.clone();
+        store
+            .apply(&chat, &[MemoryOp::Forget { target: id.clone() }], None)
+            .unwrap();
+
+        let record = store.get(&id).unwrap().unwrap();
+        assert!(record.forgotten);
+        // Forget is not invalidate: the window stays open, only recall is off.
+        assert!(record.valid_to.is_none());
+        assert!(record.superseded_by.is_none());
+    }
+
+    #[test]
+    fn a_forgotten_flag_survives_reopening() {
+        let path = std::env::temp_dir().join(format!("megumi-forget-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let chat = ChatId::new("gA");
+        let store = MemoryStore::open(&path).unwrap();
+        store
+            .apply(&chat, &[MemoryOp::Add(fact("a fact"))], None)
+            .unwrap();
+        let id = store.records().unwrap()[0].id.clone();
+        store
+            .apply(&chat, &[MemoryOp::Forget { target: id.clone() }], None)
+            .unwrap();
+        drop(store);
+
+        let reopened = MemoryStore::open(&path).unwrap();
+        assert!(reopened.get(&id).unwrap().unwrap().forgotten);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

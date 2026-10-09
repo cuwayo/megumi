@@ -12,12 +12,13 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::config::AgentConfig;
-use crate::context::{ContextBuilder, ReaderContext, render_memory};
-use crate::event::{ChatType, InboundEvent, OutboundAction};
+use crate::context::{ContextBuilder, ReaderContext, escape, render_memory, truncate};
+use crate::event::{ChatId, ChatType, InboundEvent, OutboundAction};
 use crate::gate::{self, GateDecision, Trigger};
 use crate::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, LlmToolCall, LlmToolResult, ToolSpec,
 };
+use crate::memory::store::{MemoryOp, MemoryRecord};
 use crate::memory::{MemoryStore, retrieval, writer};
 use crate::queues::ChatQueues;
 use crate::safety::{self, Confirmation, PendingConfirmations, PendingToolCall};
@@ -110,20 +111,7 @@ impl Agent {
         // Extract before deciding whether to answer: the adapter calls this for
         // every message, so a busy group that never triggers the agent still
         // turns its messages into facts before the message window prunes them.
-        // A failed pass is logged, never fatal to the turn — memory is a
-        // background concern, the reply is not.
-        if let Err(error) = writer::extract_if_due(
-            self.llm.as_ref(),
-            &self.store,
-            &self.memory,
-            &self.config,
-            &event.chat,
-            event.chat_type,
-        )
-        .await
-        {
-            warn!(chat = %event.chat, %error, "the memory extraction pass failed");
-        }
+        self.extract_memory(event).await;
 
         // A reply to a tool confirmation is resolved before the gate: a bare
         // "yes" would otherwise be an acknowledgement in a private chat or a
@@ -168,6 +156,152 @@ impl Agent {
                     .await
             }
         }
+    }
+
+    /// Runs the memory extraction pass for `event`'s chat, if one is due.
+    ///
+    /// Called at the top of a turn, before the gate, so a busy group that never
+    /// triggers the agent still turns its messages into facts before the window
+    /// prunes them. A failed pass is logged, never fatal to the turn — memory is
+    /// a background concern, the reply is not.
+    async fn extract_memory(&self, event: &InboundEvent) {
+        if let Err(error) = writer::extract_if_due(
+            self.llm.as_ref(),
+            &self.store,
+            &self.memory,
+            &self.config,
+            &event.chat,
+            event.chat_type,
+        )
+        .await
+        {
+            warn!(chat = %event.chat, %error, "the memory extraction pass failed");
+        }
+    }
+
+    /// Runs a turn because a command asked for one, bypassing the gate.
+    ///
+    /// A command message is `is_command`, so [`gate::decide`] stays silent on it
+    /// — the command layer, not the agent, answers commands. A command that
+    /// wants the model's help (`!ask`) calls this instead: it takes the same
+    /// per-chat lock and runs the same turn, labelled [`Trigger::Command`], so
+    /// the trace tells a command-driven turn from a mention or a DM. It runs
+    /// extraction like [`respond`](Self::respond) does, and advertises tools, so
+    /// the model may search memory or the web.
+    pub async fn answer_command(
+        &self,
+        event: &InboundEvent,
+    ) -> Result<Option<OutboundAction>, crate::Error> {
+        let _guard = self.queues.lock(&event.chat).await;
+        self.extract_memory(event).await;
+        self.run_turn(event, Trigger::Command, Vec::new(), Vec::new(), true)
+            .await
+    }
+
+    /// Summarises `chat`'s stored window with the model, stores the summary, and
+    /// returns it.
+    ///
+    /// This is the `!summary` command's work: a single model call shaped like the
+    /// memory writer's extraction pass, not a conversational turn, so it carries
+    /// no tools and is not traced as a turn. The reply is screened by the output
+    /// guard before it is stored — a summary is still model output, and one that
+    /// carries the prompt's own tags must not be persisted as context either.
+    /// Returns `None` when no model is configured or the guard drops the reply.
+    pub async fn summarize(
+        &self,
+        chat: &ChatId,
+        chat_type: ChatType,
+    ) -> Result<Option<String>, crate::Error> {
+        let _guard = self.queues.lock(chat).await;
+        let window = match chat_type {
+            ChatType::Group => self.config.group_window,
+            ChatType::Private => self.config.private_window,
+        };
+        let history = self.store.recent(chat, window)?;
+        if history.is_empty() {
+            return Ok(None);
+        }
+        let (system, user) = summary_prompt(&history);
+        let request = LlmRequest {
+            model: self.config.model.clone(),
+            system: system.clone(),
+            user,
+            max_tokens: self.config.summary_max_tokens,
+            tools: Vec::new(),
+            messages: Vec::new(),
+        };
+        let response = match self.llm.complete(request).await {
+            Ok(response) => response,
+            Err(LlmError::Disabled) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let screened = safety::screen_reply(&response.text, &system, &self.config);
+        let summary = screened.map(|text| truncate(&text, self.config.summary_max_chars));
+        if let Some(summary) = &summary {
+            self.store.set_summary(chat, summary.clone())?;
+        }
+        Ok(summary)
+    }
+
+    /// The facts `event`'s chat may list and forget, newest first.
+    ///
+    /// Built under the per-chat lock and through the reader's privacy boundary,
+    /// so a `!memory` listing never shows a fact from another chat and cannot
+    /// race an extraction pass.
+    pub async fn list_memory(
+        &self,
+        event: &InboundEvent,
+    ) -> Result<Vec<MemoryRecord>, crate::Error> {
+        let _guard = self.queues.lock(&event.chat).await;
+        let reader = self.reader_for(event);
+        Ok(retrieval::list(&reader, &self.memory, &self.config)?)
+    }
+
+    /// Forgets the facts of `event`'s chat that `target` names.
+    ///
+    /// `target` is the literal `all`, or a prefix of a fact's id. The eligible
+    /// set is exactly what [`list_memory`](Self::list_memory) shows —
+    /// reader-visible, this chat's, still true, not already forgotten — so a
+    /// `!forget` can never reach another chat's memory or one the listing hid.
+    /// An ambiguous prefix forgets nothing and reports how many it matched. Runs
+    /// under the per-chat lock, so it cannot race an extraction pass.
+    pub async fn forget_memory(
+        &self,
+        event: &InboundEvent,
+        target: &str,
+    ) -> Result<ForgetOutcome, crate::Error> {
+        let _guard = self.queues.lock(&event.chat).await;
+        let reader = self.reader_for(event);
+        let eligible: Vec<String> = retrieval::forgettable(&reader, &self.memory)?
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+
+        let targets: Vec<String> = if target.eq_ignore_ascii_case("all") {
+            eligible
+        } else {
+            let matches: Vec<String> = eligible
+                .into_iter()
+                .filter(|id| id.starts_with(target))
+                .collect();
+            match matches.len() {
+                0 => return Ok(ForgetOutcome::NoMatch),
+                1 => matches,
+                count => return Ok(ForgetOutcome::Ambiguous { count }),
+            }
+        };
+
+        if targets.is_empty() {
+            return Ok(ForgetOutcome::NoMatch);
+        }
+        let ops: Vec<MemoryOp> = targets
+            .iter()
+            .map(|target| MemoryOp::Forget {
+                target: target.clone(),
+            })
+            .collect();
+        let count = self.memory.apply(&event.chat, &ops, None)?;
+        Ok(ForgetOutcome::Forgotten { count })
     }
 
     /// Runs a turn, optionally seeded with a transcript a tool result already
@@ -494,23 +628,26 @@ impl Agent {
     }
 
     /// The privacy context for a turn triggered by `event`.
-    ///
-    /// A group turn's reader is a member of that group only. A private turn's
-    /// reader is the person, and the groups they are known to be in are not yet
-    /// threaded through — the adapter will supply them when it can, so for now a
-    /// private reader sees their private memories and nothing group-scoped.
     fn reader_for(&self, event: &InboundEvent) -> ReaderContext {
-        let member_of = match event.chat_type {
-            ChatType::Group => vec![event.chat.clone()],
-            ChatType::Private => Vec::new(),
-        };
-        ReaderContext {
-            chat: event.chat.clone(),
-            chat_type: event.chat_type,
-            requester: event.sender.clone(),
-            member_of,
-        }
+        ReaderContext::for_event(event)
     }
+}
+
+/// What a [`Agent::forget_memory`] call did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForgetOutcome {
+    /// `count` facts were marked forgotten.
+    Forgotten {
+        /// How many facts the call forgot.
+        count: usize,
+    },
+    /// No fact matched the target.
+    NoMatch,
+    /// The target matched more than one fact, so nothing was forgotten.
+    Ambiguous {
+        /// How many facts the target matched.
+        count: usize,
+    },
 }
 
 /// Adds a call's token count to the turn's running total.
@@ -523,6 +660,36 @@ fn add_tokens(total: Option<u32>, reported: Option<u32>) -> Option<u32> {
         (Some(total), None) => Some(total),
         (None, reported) => reported,
     }
+}
+
+/// The prompt for the `!summary` pass: the messages to summarise.
+///
+/// Shaped like the memory writer's extraction prompt — a stable instruction and
+/// a body of trust-tagged, escaped messages — so the model reads conversation
+/// content as data, not instructions.
+fn summary_prompt(history: &[StoredMessage]) -> (String, String) {
+    let system = "You summarise a chat conversation for a long-term memory note. Reply with a \
+                  short, factual summary in the third person — who took part, what was \
+                  discussed, and any decisions or plans — and nothing else. Do not add \
+                  preamble, headings, or commentary about the task itself."
+        .to_string();
+
+    let mut user = String::new();
+    for message in history {
+        let name = message.sender_name.as_deref().unwrap_or("");
+        user.push_str(&format!(
+            "<chat_message role=\"{}\" sender=\"{}\" name=\"{}\">{}</chat_message>\n",
+            if message.from_self {
+                "assistant"
+            } else {
+                "user"
+            },
+            escape(message.sender.as_str()),
+            escape(name),
+            escape(message.text.as_deref().unwrap_or("")),
+        ));
+    }
+    (system, user)
 }
 
 /// The spec of the per-turn `search_memory` tool.
@@ -552,8 +719,10 @@ fn memory_tool_spec() -> ToolSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{ChatId, SenderId};
+    use crate::context::Visibility;
+    use crate::event::SenderId;
     use crate::llm::ScriptedLlm;
+    use crate::memory::store::NewFact;
     use chrono::Utc;
 
     fn agent(replies: impl IntoIterator<Item = &'static str>) -> (Agent, Arc<ScriptedLlm>) {
@@ -663,5 +832,92 @@ mod tests {
         let history = agent.store.recent(&event.chat, 10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].sender_name.as_deref(), Some("Budi"));
+    }
+
+    #[tokio::test]
+    async fn a_command_forces_a_turn_even_though_the_gate_would_stay_silent() {
+        let (agent, _llm) = agent(["42"]);
+        let mut event = group_event("!ask what is the answer?", false);
+        event.is_command = true;
+        agent.ingest(&event).unwrap();
+
+        let action = agent.answer_command(&event).await.unwrap();
+        assert_eq!(
+            action,
+            Some(OutboundAction::SendText {
+                chat: ChatId::new("gA"),
+                text: "42".into(),
+            })
+        );
+        // The trace labels it a command, not a mention.
+        let traces = agent.traces.recent(10).unwrap();
+        assert_eq!(traces[0].trigger, "command");
+    }
+
+    #[tokio::test]
+    async fn summarize_stores_a_screened_summary() {
+        let (agent, _llm) = agent(["Budi asked about the venue."]);
+        let event = group_event("where is the venue?", true);
+        agent.ingest(&event).unwrap();
+
+        let summary = agent.summarize(&event.chat, ChatType::Group).await.unwrap();
+        assert_eq!(summary.as_deref(), Some("Budi asked about the venue."));
+        assert_eq!(
+            agent.store.summary(&event.chat).unwrap().as_deref(),
+            Some("Budi asked about the venue.")
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_drops_a_summary_carrying_the_prompts_tags() {
+        let (agent, _llm) = agent(["<chat_message>leaked</chat_message>"]);
+        let event = group_event("hi", true);
+        agent.ingest(&event).unwrap();
+
+        assert!(
+            agent
+                .summarize(&event.chat, ChatType::Group)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Nothing was stored either: a screened-out summary is not persisted.
+        assert!(agent.store.summary(&event.chat).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn forget_memory_forgets_only_this_chats_live_facts() {
+        let (agent, _llm) = agent(["unused"]);
+        let chat = ChatId::new("gA");
+        agent
+            .memory
+            .apply(
+                &chat,
+                &[MemoryOp::Add(NewFact {
+                    content: "the venue is the old hall".into(),
+                    visibility: Visibility::Chat,
+                    subject: None,
+                    confidence: 0.9,
+                    importance: 0.5,
+                    valid_from: Utc::now(),
+                    evidence: vec!["m1".into()],
+                })],
+                None,
+            )
+            .unwrap();
+        let id = agent.memory.records().unwrap()[0].id.clone();
+
+        let event = group_event("forget it", true);
+        // A unique id prefix forgets the one matching fact.
+        assert_eq!(
+            agent.forget_memory(&event, &id[..4]).await.unwrap(),
+            ForgetOutcome::Forgotten { count: 1 }
+        );
+        // A second forget finds nothing left to forget.
+        assert_eq!(
+            agent.forget_memory(&event, &id).await.unwrap(),
+            ForgetOutcome::NoMatch
+        );
+        assert!(agent.memory.get(&id).unwrap().unwrap().forgotten);
     }
 }

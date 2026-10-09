@@ -49,7 +49,7 @@ pub mod trace;
 /// into this one at the pipeline boundary.
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-pub use agent::Agent;
+pub use agent::{Agent, ForgetOutcome};
 pub use config::AgentConfig;
 pub use context::{ContextBuilder, ReaderContext, Visibility};
 pub use event::{

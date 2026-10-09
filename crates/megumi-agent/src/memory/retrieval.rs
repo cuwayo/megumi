@@ -70,6 +70,8 @@ pub fn search(
         // The privacy boundary first: a record the reader may not see is never
         // ranked, so it cannot be recalled by a lucky score.
         .filter(|record| reader.permits(&recalled(record)))
+        // A forgotten fact is never recalled, not even as history.
+        .filter(|record| !record.forgotten)
         .filter(|record| record.valid_to.is_none() || include_past)
         .map(|record| {
             let score = W_SIMILARITY * similarity(query, &record.content)
@@ -94,6 +96,50 @@ pub fn search(
         .take(config.memory_recall_top)
         .map(|(_, record)| recalled(&record))
         .collect())
+}
+
+/// The facts `reader` may see and could forget, newest first, uncapped.
+///
+/// This is the set `!memory` lists and `!forget` acts on: every fact learned in
+/// the reader's own chat that is still true and not forgotten, filtered through
+/// the reader's privacy boundary first. Sharing one function keeps the two
+/// commands on the same set, so a fact `!memory` does not show is never one
+/// `!forget` would silently remove. [`list`] truncates this for display.
+pub fn forgettable(
+    reader: &ReaderContext,
+    store: &MemoryStore,
+) -> Result<Vec<MemoryRecord>, String> {
+    let mut records: Vec<MemoryRecord> = store
+        .records()?
+        .into_iter()
+        .filter(|record| reader.permits(&recalled(record)))
+        .filter(|record| record.origin_chat == reader.chat)
+        .filter(|record| record.valid_to.is_none() && !record.forgotten)
+        .collect();
+
+    // Newest-first, then id, so the same store always lists the same way.
+    records.sort_by(|a, b| {
+        b.valid_from
+            .cmp(&a.valid_from)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(records)
+}
+
+/// The facts `reader` may see for `!memory`, newest first and capped.
+///
+/// The listing half of [`forgettable`]: the same set, truncated to
+/// [`AgentConfig::memory_list_top`]. Returns full [`MemoryRecord`]s, not
+/// [`RecalledMemory`]s, because the listing shows each fact's id so `!forget`
+/// can name one.
+pub fn list(
+    reader: &ReaderContext,
+    store: &MemoryStore,
+    config: &AgentConfig,
+) -> Result<Vec<MemoryRecord>, String> {
+    let mut records = forgettable(reader, store)?;
+    records.truncate(config.memory_list_top);
+    Ok(records)
 }
 
 /// A record as the context builder takes it, before the reader filter.
@@ -297,5 +343,128 @@ mod tests {
         assert!(is_past_question("where was it before?"));
         assert!(is_past_question("what did it used to be"));
         assert!(!is_past_question("where is it now?"));
+    }
+
+    #[test]
+    fn a_forgotten_fact_is_never_recalled_not_even_as_history() {
+        let store = MemoryStore::open(":memory:").unwrap();
+        let chat = ChatId::new("gA");
+        store
+            .apply(
+                &chat,
+                &[MemoryOp::Add(fact(
+                    "The venue is the old hall.",
+                    Visibility::Chat,
+                    None,
+                ))],
+                None,
+            )
+            .unwrap();
+        let id = store.records().unwrap()[0].id.clone();
+        store
+            .apply(&chat, &[MemoryOp::Forget { target: id }], None)
+            .unwrap();
+
+        let config = AgentConfig::for_test();
+        let group = reader(ChatType::Group, "gA", &["gA"]);
+        // Neither a present-tense nor a past-tense question recalls it: forget
+        // is stronger than invalidate.
+        assert!(
+            search(&group, "where is the venue?", &store, &config, Utc::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            search(
+                &group,
+                "where was the venue before?",
+                &store,
+                &config,
+                Utc::now()
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn list_shows_only_this_chats_live_unforgotten_facts() {
+        let store = MemoryStore::open(":memory:").unwrap();
+        let config = AgentConfig::for_test();
+        // A group fact, a private fact, and a superseded one, all in chats the
+        // group reader is not listing.
+        store
+            .apply(
+                &ChatId::new("gA"),
+                &[MemoryOp::Add(fact("group fact", Visibility::Chat, None))],
+                None,
+            )
+            .unwrap();
+        store
+            .apply(
+                &ChatId::new("dm"),
+                &[MemoryOp::Add(fact(
+                    "private fact",
+                    Visibility::Private,
+                    None,
+                ))],
+                None,
+            )
+            .unwrap();
+        store
+            .apply(
+                &ChatId::new("gA"),
+                &[MemoryOp::Add(fact("old fact", Visibility::Chat, None))],
+                None,
+            )
+            .unwrap();
+        let old_id = store
+            .records()
+            .unwrap()
+            .iter()
+            .find(|r| r.content == "old fact")
+            .unwrap()
+            .id
+            .clone();
+        store
+            .apply(
+                &ChatId::new("gA"),
+                &[MemoryOp::Forget { target: old_id }],
+                None,
+            )
+            .unwrap();
+
+        let group = reader(ChatType::Group, "gA", &["gA"]);
+        let listed = list(&group, &store, &config).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].content, "group fact");
+
+        // The private chat lists its own fact, and only it.
+        let dm = reader(ChatType::Private, "dm", &[]);
+        let listed = list(&dm, &store, &config).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].content, "private fact");
+    }
+
+    #[test]
+    fn list_is_capped_and_newest_first() {
+        let store = MemoryStore::open(":memory:").unwrap();
+        let chat = ChatId::new("gA");
+        for i in 0..5 {
+            let mut f = fact(&format!("fact {i}"), Visibility::Chat, None);
+            f.valid_from = Utc::now() + chrono::Duration::seconds(i);
+            store.apply(&chat, &[MemoryOp::Add(f)], None).unwrap();
+        }
+        let mut config = AgentConfig::for_test();
+        config.memory_list_top = 2;
+        let group = reader(ChatType::Group, "gA", &["gA"]);
+        let listed = list(&group, &store, &config).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].content, "fact 4");
+        assert_eq!(listed[1].content, "fact 3");
+
+        // The listing is capped, but the forgettable set is not: `!forget` must
+        // be able to reach a fact the display truncated.
+        assert_eq!(forgettable(&group, &store).unwrap().len(), 5);
     }
 }

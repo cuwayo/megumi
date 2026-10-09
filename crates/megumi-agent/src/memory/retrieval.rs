@@ -150,8 +150,9 @@ fn recalled(record: &MemoryRecord) -> RecalledMemory {
 /// contains.
 ///
 /// Lexical, not semantic: the v1 stand-in for an embedding, to be replaced when
-/// a vector score is available. A query with no words matches nothing.
-fn similarity(query: &str, content: &str) -> f32 {
+/// a vector score is available. A query with no words matches nothing. Shared
+/// with the history-search tool, which ranks messages the same way.
+pub(crate) fn similarity(query: &str, content: &str) -> f32 {
     let terms = terms(query);
     if terms.is_empty() {
         return 0.0;

@@ -205,7 +205,7 @@ hook is set, the framework subscribes to every event kind, not just `Messages`; 
 ## The AI agent
 
 > **Continuing the agent work? Read [`docs/AGENT.md`](docs/AGENT.md) first.** It
-> records what is built (milestones 1–9), the decisions that must not regress,
+> records what is built (milestones 1–13), the decisions that must not regress,
 > and where the work stands. The architecture below is the reference;
 > `docs/AGENT.md` is the state and roadmap.
 
@@ -235,14 +235,16 @@ JSON store, `writer` extraction, `reflection`/`consolidate` insights and dedup, 
 `docs/AGENT.md` for the decisions that must not regress.
 
 **The tool loop (milestone 5)** is `run_turn`: it advertises the registry's tools — `search_memory`
-(`SearchMemory`, over the agent's memory store, so it filters through `retrieval::search`), `web_search`
-(present only with `TAVILY_API_KEY`), and any the bot adds — runs any calls, appends the results, and repeats
-up to `max_tool_iterations` — the last iteration only answers. Each call is handed a `ToolContext` built
-from the turn's `ReaderContext`, so a tool that acts on the conversation knows the chat and the reader while
-the registry stays shared across chats. `LlmMessage` is the three-shape turn (text, tool
-calls, tool results) the Messages API needs, and both the Anthropic `tool_use` and OpenAI `tool_calls`
-shapes parse into it. Tool calls are recorded on the turn's `TurnTrace`. A tool failure is a result handed
-back to the model, never a failed turn, and the extraction pass sends no tools so its request is unchanged.
+(`SearchMemory`, over the agent's memory store, so it filters through `retrieval::search`), `search_history`
+(`SearchHistory`, over the agent's message store, so the model can reach messages older than the prompt
+window), `web_search` (present only with `TAVILY_API_KEY`), and any the bot adds — runs any calls, appends
+the results, and repeats up to `max_tool_iterations` — the last iteration only answers. Each call is handed
+a `ToolContext` built from the turn's `ReaderContext`, so a tool that acts on the conversation knows the
+chat and the reader while the registry stays shared across chats. `LlmMessage` is the three-shape turn
+(text, tool calls, tool results) the Messages API needs, and both the Anthropic `tool_use` and OpenAI
+`tool_calls` shapes parse into it. Tool calls are recorded on the turn's `TurnTrace`. A tool failure is a
+result handed back to the model, never a failed turn, and the extraction pass sends no tools so its request
+is unchanged.
 
 **The safety layer (milestone 6)** is `safety.rs`. `screen_reply` is the one place a reply becomes
 sendable: it drops an empty/`NO_REPLY` reply, one carrying the prompt's own trust tags, or one reciting the

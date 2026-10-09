@@ -115,6 +115,14 @@ pub struct AgentConfig {
     pub web_search_max_chars: usize,
     /// The base URL of the web-search API.
     pub web_search_base: String,
+    /// How many messages a history search returns.
+    ///
+    /// The message store keeps a window far larger than the prompt shows, so
+    /// the model can reach an older message by asking; this caps how many
+    /// matches come back at once.
+    pub history_search_results: usize,
+    /// The most characters of history-search results handed back to the model.
+    pub history_search_max_chars: usize,
     /// Whether a turn plans before it answers.
     ///
     /// The planner makes one extra model call to sketch a short plan for a
@@ -177,6 +185,8 @@ impl Default for AgentConfig {
             web_search_results: 5,
             web_search_max_chars: 4_000,
             web_search_base: "https://api.tavily.com".to_string(),
+            history_search_results: 8,
+            history_search_max_chars: 4_000,
             planner_enabled: true,
             plan_min_words: 12,
             plan_max_tokens: 256,
@@ -265,6 +275,10 @@ impl AgentConfig {
             web_search_max_chars: env_usize("AGENT_WEB_SEARCH_MAX_CHARS")
                 .unwrap_or(default.web_search_max_chars),
             web_search_base: std::env::var("TAVILY_API_BASE").unwrap_or(default.web_search_base),
+            history_search_results: env_usize("AGENT_HISTORY_SEARCH_RESULTS")
+                .unwrap_or(default.history_search_results),
+            history_search_max_chars: env_usize("AGENT_HISTORY_SEARCH_MAX_CHARS")
+                .unwrap_or(default.history_search_max_chars),
             planner_enabled: env_bool("AGENT_PLANNING_ENABLED").unwrap_or(default.planner_enabled),
             plan_min_words: env_usize("AGENT_PLAN_MIN_WORDS").unwrap_or(default.plan_min_words),
             plan_max_tokens: env_usize("AGENT_PLAN_TOKENS")
@@ -425,6 +439,13 @@ mod tests {
         // request-count assertions stay exact.
         assert!(!AgentConfig::for_test().reflection_enabled);
         assert!(AgentConfig::default().reflection_enabled);
+    }
+
+    #[test]
+    fn the_history_search_knobs_have_the_designed_defaults() {
+        let config = AgentConfig::default();
+        assert_eq!(config.history_search_results, 8);
+        assert_eq!(config.history_search_max_chars, 4_000);
     }
 
     #[test]

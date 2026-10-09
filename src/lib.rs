@@ -134,11 +134,19 @@ fn build_agent(reminders: Arc<ReminderStore>) -> Arc<megumi_agent::Agent> {
             }
         };
 
-    // `search_memory` is registered over the agent's own memory store, so a turn
-    // may recall facts through the same privacy boundary the prompt uses.
-    let mut tools: Vec<Arc<dyn megumi_agent::Tool>> = vec![Arc::new(
-        megumi_agent::SearchMemory::new(Arc::clone(&memory), config.clone()),
-    )];
+    // `search_memory` and `search_history` are registered over the agent's own
+    // stores, so a turn may recall facts — or earlier messages past the prompt
+    // window — through the same chat scoping the prompt uses.
+    let mut tools: Vec<Arc<dyn megumi_agent::Tool>> = vec![
+        Arc::new(megumi_agent::SearchMemory::new(
+            Arc::clone(&memory),
+            config.clone(),
+        )),
+        Arc::new(megumi_agent::SearchHistory::new(
+            Arc::clone(&store),
+            config.clone(),
+        )),
+    ];
     // `set_reminder` writes to the bot's reminder store, and is state-changing,
     // so the agent holds its calls for a confirmation.
     tools.push(Arc::new(agent::tools::SetReminder::new(reminders)));

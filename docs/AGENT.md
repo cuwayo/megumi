@@ -10,7 +10,7 @@ memory, context, reasoning, tools, safety, evals). We are implementing it in the
 milestones that spec lays out, and its own rule applies: **do not start a later
 milestone until the earlier one's exit criteria pass.**
 
-## What is built (milestones 1–12)
+## What is built (milestones 1–13)
 
 | Milestone | Status |
 |---|---|
@@ -26,6 +26,7 @@ milestone until the earlier one's exit criteria pass.**
 | 10. Media understanding (voice transcription + image description) | **done** (adapter-side, OpenAI-compatible, optional) |
 | 11. Tool context + the first consequential tool | **done** (`ToolContext`; `search_memory` as a real tool; `set_reminder` behind the confirmation gate) |
 | 12. Grounding — the agent gets a clock | **done** (a `<now>` prompt layer from the trigger's timestamp; guard drops an echoed one) |
+| 13. History search — the model can reach past the prompt window | **done** (`search_history` over the message store, scoped to the turn's chat) |
 
 ### Where things live
 
@@ -37,7 +38,7 @@ milestone until the earlier one's exit criteria pass.**
   `consolidate` (duplicate suppression), `retrieval` (ranking behind the privacy
   filter).
 - `crates/megumi-agent/src/tools.rs` — the `Tool` trait, `ToolContext`, the
-  `ToolRegistry`, and the `SearchMemory` and `WebSearch` tools.
+  `ToolRegistry`, and the `SearchMemory`, `SearchHistory`, and `WebSearch` tools.
 - `crates/megumi-agent/src/safety.rs` — the output guard, the confirmation gate,
   and the pending-confirmation store.
 - `crates/megumi-agent/src/reasoning.rs` — the planner and the evaluator, the two
@@ -56,9 +57,9 @@ milestone until the earlier one's exit criteria pass.**
   (mirrors `src/news/`).
 - `src/events.rs` — the single framework `event_handler`, fanning out to the news
   digest, the reminders, and the agent.
-- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,router,reasoning,reflection,media,live}.rs` —
-  end-to-end, eval, memory, tool-loop, prompt-injection, reasoning, reflection,
-  media, and live smoke tests.
+- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,history,injection,router,reasoning,reflection,media,live}.rs` —
+  end-to-end, eval, memory, tool-loop, history-search, prompt-injection,
+  reasoning, reflection, media, and live smoke tests.
 
 ## Decisions that must not regress
 
@@ -548,16 +549,58 @@ writer, and `!summary` do **not** get a clock: they do not resolve relative date
 (the writer stamps `valid_from` in code from the evidence messages), so adding
 one there would be surface without a need.
 
+## Milestone 13 — history search (done)
+
+Goal: let the model reach a message older than the prompt's window. The store
+keeps `max_stored_messages` (200) per chat but the prompt carries only
+`group_window`/`private_window` (30/40), so older messages are durable yet
+invisible. Built in `crates/megumi-agent/src/tools.rs`, on the `SearchMemory`
+template:
+
+- **`SearchHistory`** holds `Arc<MessageStore>` + `AgentConfig` and registers as
+  `search_history`. On a call it reads `store.recent(context.chat(),
+  max_stored_messages)` — the whole stored window, not the prompt's smaller one —
+  scores each message with `retrieval::similarity` (promoted to `pub(crate)`, the
+  same lexical v1 stand-in facts use), over a haystack of the message's text plus
+  its described-attachment note, keeps only `score > 0`, sorts best-first (ties
+  newest-first, then id), takes `history_search_results` (8), and renders them as
+  plain escaped lines capped at `history_search_max_chars` (4000). Read-only, so
+  it leaves `Tool::confirmation` at its `None` default.
+- **Rendering is untagged**, unlike the prompt's own `render_message`: a tool
+  result carrying the prompt's internal `<chat_message>` tags risks the model
+  echoing them, which the output guard would then drop. Each line is
+  `` - {name} ({timestamp}): {text} `` with every field escaped, mirroring how
+  `render_memory` feeds untagged lines to the `search_memory` tool channel.
+- **Scoping is structural.** The message store is keyed by `ChatId` and the tool
+  reads only `context.chat()`, so a group turn cannot reach a private chat's or
+  another group's messages — the same boundary the prompt has, and decision #11
+  (a tool learns its turn from the `ToolContext`). A canary test locks it in.
+- **Config knobs** (env-overridable): `history_search_results`
+  (`AGENT_HISTORY_SEARCH_RESULTS`, 8), `history_search_max_chars`
+  (`AGENT_HISTORY_SEARCH_MAX_CHARS`, 4000). `for_test` is unchanged — it keeps
+  `max_tool_iterations = 0`, so no exact-request-count test is disturbed.
+- Evals: `crates/megumi-agent/tests/history.rs` (a message outside the prompt
+  window is absent from the prompt but reachable through the tool and its content
+  reaches the model; a private chat's message is not reachable from a group
+  turn), plus unit tests in `tools.rs` (matching, no-match, missing query, cap and
+  order, attachment-description match, chat scoping, truncation).
+
+**Do not regress:** the tool reads only `context.chat()` from the store, so the
+per-chat scoping the prompt has holds on the tool path — a group turn cannot read
+a DM's or another group's history. It is read-only, so it needs no confirmation
+and adds no state-changing surface. Its results are untagged plain lines, so a
+tool result cannot smuggle the prompt's internal tags into a reply the output
+guard would then drop.
+
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
 2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,reasoning,store}.rs`
    to see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Milestones 1–12 are done. The original design spec is not in the repo, so any
+4. Milestones 1–13 are done. The original design spec is not in the repo, so any
    further work is a new interpretation: add more bot-side tools (a `set_reminder`
    is the template — a store the bot owns, plus a `confirmation` when it changes
-   state), add a history-search tool so the model can reach messages older than
-   the context window, extend the evals, tune the reflection, retrieval, and media
-   knobs against real traffic, or add video/document understanding to the
-   adapter's `media` seam.
+   state), extend the evals, tune the reflection, retrieval, and media knobs
+   against real traffic, or add video/document understanding to the adapter's
+   `media` seam.

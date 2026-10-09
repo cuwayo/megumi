@@ -310,6 +310,41 @@ async fn the_episodic_summary_reaches_the_context() {
 }
 
 #[tokio::test]
+async fn the_current_time_reaches_the_context() {
+    // Grounding: the prompt carries the trigger's own instant, so the model can
+    // resolve "tomorrow" or "next Friday" instead of guessing. The grader reads
+    // the request rather than the prose, so it stays deterministic.
+    let harness = Harness::new(["sure"]);
+    let at = chrono::DateTime::parse_from_rfc3339("2026-10-09T08:15:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    harness
+        .feed(
+            &group("gA", "u1", "@bot what's tomorrow?")
+                .mention()
+                .at(at)
+                .build(),
+        )
+        .await;
+
+    let request = harness.llm.requests().pop().unwrap();
+    let local = at.with_timezone(&chrono::Local);
+    assert!(request.user.contains("<now>"), "{}", request.user);
+    assert!(
+        request
+            .user
+            .contains(&local.format("%Y-%m-%dT%H:%M:%S%:z").to_string()),
+        "{}",
+        request.user
+    );
+    assert!(
+        request.system.contains("<now>"),
+        "the system prompt must explain the clock: {}",
+        request.system
+    );
+}
+
+#[tokio::test]
 async fn a_long_gap_starts_a_new_session() {
     // Session handling: after a pause longer than the session gap, a private
     // turn does not replay the old conversation. Storage keeps it (it is still

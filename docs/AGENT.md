@@ -10,7 +10,7 @@ memory, context, reasoning, tools, safety, evals). We are implementing it in the
 milestones that spec lays out, and its own rule applies: **do not start a later
 milestone until the earlier one's exit criteria pass.**
 
-## What is built (milestones 1–11)
+## What is built (milestones 1–12)
 
 | Milestone | Status |
 |---|---|
@@ -25,6 +25,7 @@ milestone until the earlier one's exit criteria pass.**
 | 9. Consolidation, reflections, tuning | **done** (reflections, dedup, tunable weights) |
 | 10. Media understanding (voice transcription + image description) | **done** (adapter-side, OpenAI-compatible, optional) |
 | 11. Tool context + the first consequential tool | **done** (`ToolContext`; `search_memory` as a real tool; `set_reminder` behind the confirmation gate) |
+| 12. Grounding — the agent gets a clock | **done** (a `<now>` prompt layer from the trigger's timestamp; guard drops an echoed one) |
 
 ### Where things live
 
@@ -510,15 +511,53 @@ still reads through `retrieval::search`, so the private-to-group boundary holds 
 the tool path. `set_reminder` is the tool that owns the confirmation decision —
 the model cannot talk past it — and it schedules only into the turn's chat.
 
+## Milestone 12 — grounding, the agent gets a clock (done)
+
+Goal: give the model the current time so relative words in a message ("today",
+"tomorrow", "in an hour", "next Friday") resolve against something concrete
+instead of being guessed. Built in `crates/megumi-agent/src/context.rs`, with a
+one-line addition to the output guard:
+
+- `context.rs::render_now` — a `<now>` layer at the **head** of the prompt body,
+  so it frames every layer below it, message timestamps included. The instant is
+  the **trigger message's own `timestamp`**, not `Utc::now()`: a turn is about
+  the message that prompted it, and anchoring to that message keeps a replayed or
+  re-graded transcript deterministic (and makes the eval a fixed assertion rather
+  than a moving one). It is rendered in the process's **local** timezone with the
+  offset and weekday (`2026-10-09T15:30:00+08:00 (Friday)`), because "tomorrow"
+  is a local-calendar question.
+- `context.rs::system_prompt` — a stable sentence tells the model what `<now>` is
+  for and that message timestamps are given alongside each message. The sentence
+  is part of the byte-identical system prefix, so the prompt stays cacheable.
+- `safety.rs::INTERNAL_TAGS` — gained `<now`/`</now`, so a reply that echoes the
+  clock scaffolding is dropped like any other internal tag (the milestone-6
+  guard, unchanged in spirit).
+- Evals: a `the_current_time_reaches_the_context` case in `tests/eval.rs` (the
+  trigger's local instant reaches the prompt and the system prompt explains the
+  tag), plus unit tests in `context.rs` (the layer heads the body, carries the
+  trigger's instant, offset, and weekday) and `safety.rs` (an echoed `<now>` is
+  suppressed).
+
+**Do not regress:** the clock is the **trigger's timestamp**, not the wall clock,
+so a stored or replayed message renders the same prompt. It is a plain `<now>`
+value, not a trust tag, and it is escaped/rendered like the rest of the
+scaffolding — the model reads it as data. The system prompt stays byte-identical
+across turns (the `<now>` value lives in the volatile user body, never in the
+system prompt), so the cacheable prefix is unchanged. The planner, the memory
+writer, and `!summary` do **not** get a clock: they do not resolve relative dates
+(the writer stamps `valid_from` in code from the evidence messages), so adding
+one there would be surface without a need.
+
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
 2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,reasoning,store}.rs`
    to see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Milestones 1–11 are done. The original design spec is not in the repo, so any
+4. Milestones 1–12 are done. The original design spec is not in the repo, so any
    further work is a new interpretation: add more bot-side tools (a `set_reminder`
    is the template — a store the bot owns, plus a `confirmation` when it changes
-   state), extend the evals, tune the reflection, retrieval, and media knobs
-   against real traffic, or add video/document understanding to the adapter's
-   `media` seam.
+   state), add a history-search tool so the model can reach messages older than
+   the context window, extend the evals, tune the reflection, retrieval, and media
+   knobs against real traffic, or add video/document understanding to the
+   adapter's `media` seam.

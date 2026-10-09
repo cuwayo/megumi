@@ -43,6 +43,8 @@ const INTERNAL_TAGS: &[&str] = &[
     "</conversation_summary",
     "<plan",
     "</plan",
+    "<now",
+    "</now",
     "<reply_to",
     "</reply_to",
 ];
@@ -256,6 +258,8 @@ mod tests {
         assert!(screen_reply("<memories>secret</memories>", system, &config()).is_none());
         assert!(screen_reply("ok </chat_message> done", system, &config()).is_none());
         assert!(screen_reply("<CONVERSATION_SUMMARY>x", system, &config()).is_none());
+        // The clock layer is scaffolding too, so echoing it is dropped.
+        assert!(screen_reply("<now>2026-10-09T12:00:00Z</now>", system, &config()).is_none());
     }
 
     #[test]

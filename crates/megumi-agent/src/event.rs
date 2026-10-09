@@ -80,12 +80,17 @@ impl std::fmt::Display for SenderId {
 ///
 /// The agent does not fetch or decode media itself; an adapter that can turn a
 /// voice note into text does so before building the event, so the model sees a
-/// description rather than a pointer it cannot resolve.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// description rather than a pointer it cannot resolve. `description` is that
+/// adapter-produced rendering — a transcript or an image description — and is
+/// `None` when the adapter could not produce one. A caption is not stored here:
+/// the adapter puts it in [`InboundEvent::text`], so carrying it twice would
+/// duplicate it in the prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     /// What kind of media this is, for the model's benefit.
     pub kind: String,
-    /// A text rendering of the media — a transcript, a caption, a description.
+    /// A text rendering of the media — a transcript or a description — when the
+    /// adapter could produce one.
     pub description: Option<String>,
 }
 

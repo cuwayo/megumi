@@ -13,7 +13,7 @@ tracing = { version = "0.1.44", features = ["async-await", "attributes"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 megumi = { package = "megumi-framework", path = "crates/megumi-framework" }
 megumi-agent = { path = "crates/megumi-agent" }
-reqwest = { version = "0.13.5", features = ["json"] }
+reqwest = { version = "0.13.5", features = ["json", "multipart"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 uuid = { version = "1.26.1", features = ["v4"] }

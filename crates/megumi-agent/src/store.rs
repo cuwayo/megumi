@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::event::{ChatId, SenderId};
+use crate::event::{Attachment, ChatId, SenderId};
 
 /// One stored message, as the context builder and summarizer read it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,6 +32,12 @@ pub struct StoredMessage {
     pub sender_name: Option<String>,
     /// The message text, when it had any.
     pub text: Option<String>,
+    /// The media the message carried, as the adapter described it.
+    ///
+    /// Defaulted so a chat file written before media understanding existed still
+    /// loads, reading as a message with no attachments.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     /// Whether the agent itself sent this message.
     pub from_self: bool,
     /// When the message was sent.
@@ -249,6 +255,7 @@ mod tests {
             sender: SenderId::new("u"),
             sender_name: None,
             text: Some(text.into()),
+            attachments: Vec::new(),
             from_self: false,
             timestamp: Utc::now(),
         }

@@ -211,7 +211,9 @@ hook is set, the framework subscribes to every event kind, not just `Messages`; 
 
 `crates/megumi-agent` is a **platform-agnostic** agent core (lib name `megumi_agent`); it never imports
 `whatsapp-rust`. `src/agent/` is the only place that knows both, converting `whatsapp_rust` messages into
-`megumi_agent::InboundEvent`s and sending the `OutboundAction`s back. The pipeline is: store every message →
+`megumi_agent::InboundEvent`s and sending the `OutboundAction`s back; `src/agent/media.rs` is the optional
+OpenAI-compatible provider that transcribes a voice note or describes an image before the event is built
+(the adapter, not the core, reads media — milestone 10). The pipeline is: store every message →
 gate (whether to speak) → build a budgeted, trust-tagged prompt → call the model, running any tool calls →
 record a trace. Modules:
 `event` (types), `config` (`AgentConfig`), `store` (per-chat JSON history, one file per chat, bounded

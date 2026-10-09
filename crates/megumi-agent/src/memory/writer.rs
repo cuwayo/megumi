@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::config::AgentConfig;
-use crate::context::{Visibility, escape, strip_code_fence, truncate};
+use crate::context::{Visibility, attachment_note, escape, strip_code_fence, truncate};
 use crate::event::{ChatId, ChatType, SenderId};
 use crate::llm::{LlmClient, LlmError, LlmRequest};
 use crate::memory::consolidate;
@@ -188,13 +188,18 @@ fn extraction_prompt(
     user.push_str("<recent_messages>\n");
     for message in pending {
         let name = message.sender_name.as_deref().unwrap_or("");
+        let text = format!(
+            "{}{}",
+            attachment_note(&message.attachments),
+            escape(message.text.as_deref().unwrap_or("")),
+        );
         user.push_str(&format!(
             "<chat_message id=\"{}\" sender=\"{}\" name=\"{}\" ts=\"{}\">{}</chat_message>\n",
             escape(&message.message_id),
             escape(message.sender.as_str()),
             escape(name),
             message.timestamp.to_rfc3339(),
-            escape(message.text.as_deref().unwrap_or("")),
+            text,
         ));
     }
     user.push_str("</recent_messages>");
@@ -356,6 +361,7 @@ mod tests {
             sender: SenderId::new(sender),
             sender_name: Some(sender.into()),
             text: Some(text.into()),
+            attachments: Vec::new(),
             from_self: false,
             timestamp: Utc::now() - chrono::Duration::minutes(minutes_ago),
         }

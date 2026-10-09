@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::agent::media::OpenAiMedia;
 use crate::news::store::NewsStore;
 use crate::reminders::store::ReminderStore;
 
@@ -35,4 +36,9 @@ pub struct Data {
     /// rather than the first message; the agent never needs the connected
     /// client, only the adapter does.
     pub agent: Arc<megumi_agent::Agent>,
+    /// The optional media-understanding provider the adapter transcribes voice
+    /// notes and describes images with. `None` without a credential, in which
+    /// case the adapter describes nothing and a message's media reaches the
+    /// model as its kind alone.
+    pub media: Option<OpenAiMedia>,
 }

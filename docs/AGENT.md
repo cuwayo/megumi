@@ -23,6 +23,7 @@ milestone until the earlier one's exit criteria pass.**
 | 7. Commands + rate limits (the deterministic command router) | **done** (`!ask`, `!summary`, `!memory`, `!forget`, `!remind`) |
 | 8. Planner/evaluator | **done** (plan before, evaluate + bounded revise after) |
 | 9. Consolidation, reflections, tuning | **done** (reflections, dedup, tunable weights) |
+| 10. Media understanding (voice transcription + image description) | **done** (adapter-side, OpenAI-compatible, optional) |
 
 ### Where things live
 
@@ -42,15 +43,17 @@ milestone until the earlier one's exit criteria pass.**
 - `src/agent/mod.rs` — the WhatsApp adapter (`InboundMessage` → `InboundEvent`,
   mention/reply/identity detection, sending actions). `event_from_parts` is the
   shared core both a live message and a command's `MessageContext` go through.
+- `src/agent/media.rs` — the optional OpenAI-compatible media provider the
+  adapter transcribes voice notes and describes images with (milestone 10).
 - `src/commands/{ask,summary,memory,forget,remind}/` — the assistant commands
   (the `assistant` group), the deterministic entry points to the agent.
 - `src/reminders/` — `!remind`'s store, duration parser, and scheduler loop
   (mirrors `src/news/`).
 - `src/events.rs` — the single framework `event_handler`, fanning out to the news
   digest, the reminders, and the agent.
-- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,router,reasoning,reflection,live}.rs` —
+- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,router,reasoning,reflection,media,live}.rs` —
   end-to-end, eval, memory, tool-loop, prompt-injection, reasoning, reflection,
-  and live smoke tests.
+  media, and live smoke tests.
 
 ## Decisions that must not regress
 
@@ -91,6 +94,14 @@ These were chosen deliberately; a later change that breaks one is a regression.
 9. **Retrieval filters by `ReaderContext` before it ranks.** A fact the reader
    may not see is never scored, so the private-to-group leak cannot happen
    upstream of the filter.
+10. **Media is described by the adapter, and `Attachment::description` carries
+    only the provider's output.** The agent core never fetches or decodes media;
+    the adapter is the one place with both the bytes and the client. A caption is
+    not copied into `description` — it already rides in the message text — so
+    without a provider a message renders exactly as before media understanding
+    existed. The adapter reads only the message's *own* media
+    (`Attachment::own`), never a quoted message's, so a text reply to an image
+    does not get the image's description attributed to it.
 
 ## How to run and verify
 
@@ -398,13 +409,57 @@ config-aware pass, never in `apply`. The pass must stay off in
 `AgentConfig::for_test()`: the tool, reasoning, and router tests assert exact
 request counts, and a stray reflection call would break them.
 
+## Milestone 10 — media understanding (done)
+
+Goal: turn a voice note or an image into text so the model — and memory
+extraction and `!summary` — can use it. Built in `src/agent/media.rs` (the
+provider) and `src/agent/mod.rs` (the adapter), with the agent core persisting
+and rendering the result:
+
+- `src/agent/media.rs` — `OpenAiMedia`, an OpenAI-compatible provider.
+  `from_env` reads `MEDIA_API_KEY` then `OPENAI_API_KEY` and returns `None`
+  without one, so an unconfigured bot has no media understanding.
+  `transcribe` POSTs a multipart body to `{base}/audio/transcriptions`;
+  `describe_image` POSTs a base64 data URI to `{base}/chat/completions`. Both cap
+  their reply (`MEDIA_MAX_CHARS`), and `max_bytes` guards the download. It is a
+  concrete type in the bot crate, not a trait in `megumi-agent`: its only caller
+  is the adapter, so a core abstraction would be a module the pipeline never
+  calls.
+- `src/agent/mod.rs::attachments` — reads the message's **own** media
+  (`megumi::Attachment::own`, not `from_message`, so a quoted image is not
+  attributed to the reply quoting it), refuses anything over `max_bytes`, then
+  downloads via `client.download` and calls the provider. The result is the
+  attachment's `description`; any failure logs and leaves it `None`. Only audio
+  and images are sent — video, documents, and stickers keep their kind alone.
+- `megumi-agent` core — `StoredMessage` gained `#[serde(default)] attachments`
+  (`Attachment` gained `PartialEq, Eq` to hold it), `Agent::ingest` copies them,
+  and `context::attachment_note` renders a described attachment as an escaped
+  `[kind: …]` prefix inside the message's own `<chat_message>` line. That helper
+  is reused by the extraction prompt and `!summary`, so media can become a fact
+  or a summary too. The note is a plain prefix, not a tag, so `INTERNAL_TAGS` and
+  the system prompt are unchanged.
+- `gate.rs` — a private message whose only content is a **described** attachment
+  is answered rather than swallowed as an acknowledgement; an undescribed one
+  stays silent, as before.
+- Evals: `crates/megumi-agent/tests/media.rs` (a description reaches the prompt;
+  a described attachment makes a text-less DM answerable and can become a fact;
+  an undescribed one stays silent and costs no call; a description cannot close a
+  trust tag), plus unit tests in `media.rs`, `context.rs`, and `gate.rs`.
+
+**Do not regress:** the provider is optional and the no-key path is byte-identical
+to the pre-milestone behaviour. `Attachment::description` is provider output
+only — never the caption, which already rides in the message text — so nothing is
+duplicated and a provider failure degrades to the kind alone. The adapter reads
+only the message's own media. The description is untrusted, so it is escaped like
+any other text and rendered as a plain prefix, not a trust tag.
+
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
 2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,reasoning,store}.rs`
    to see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Milestones 1–9 are done. The original design spec is not in the repo, so any
-   further work is a new interpretation: extend the evals, tune the reflection
-   and retrieval knobs against real traffic, or add a media-understanding
-   adapter for attachments (see the adapter's `attachments` seam).
+4. Milestones 1–10 are done. The original design spec is not in the repo, so any
+   further work is a new interpretation: extend the evals, tune the reflection,
+   retrieval, and media knobs against real traffic, or add video/document
+   understanding to the adapter's `media` seam.

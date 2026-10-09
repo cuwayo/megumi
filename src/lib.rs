@@ -59,6 +59,16 @@ pub fn framework() -> Framework<Data> {
         Arc::new(ReminderStore::open(reminder_path).unwrap_or_else(|error| panic!("{error}")));
     let started = Instant::now();
     let agent = build_agent();
+    // The media-understanding provider is optional: without a credential it is
+    // `None` and the adapter describes nothing, so media reaches the model as
+    // its kind alone.
+    let media = agent::media::OpenAiMedia::from_env();
+    if media.is_none() {
+        tracing::warn!(
+            "no MEDIA_API_KEY or OPENAI_API_KEY is set; voice notes and images will not be \
+             described"
+        );
+    }
 
     Framework::builder()
         .setup(move |_client| {
@@ -73,6 +83,7 @@ pub fn framework() -> Framework<Data> {
                     reminders,
                     remind_task: tokio::sync::Mutex::new(None),
                     agent,
+                    media,
                 })
             }
         })

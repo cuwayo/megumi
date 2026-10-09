@@ -12,7 +12,9 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::config::AgentConfig;
-use crate::context::{ContextBuilder, Prompt, ReaderContext, escape, render_memory, truncate};
+use crate::context::{
+    ContextBuilder, Prompt, ReaderContext, attachment_note, escape, render_memory, truncate,
+};
 use crate::event::{ChatId, ChatType, InboundEvent, OutboundAction};
 use crate::gate::{self, GateDecision, Trigger};
 use crate::llm::{
@@ -90,6 +92,7 @@ impl Agent {
             sender: event.sender.clone(),
             sender_name: event.sender_name.clone(),
             text: event.text.clone(),
+            attachments: event.attachments.clone(),
             from_self: event.from_self,
             timestamp: event.timestamp,
         };
@@ -841,6 +844,11 @@ fn summary_prompt(history: &[StoredMessage]) -> (String, String) {
     let mut user = String::new();
     for message in history {
         let name = message.sender_name.as_deref().unwrap_or("");
+        let text = format!(
+            "{}{}",
+            attachment_note(&message.attachments),
+            escape(message.text.as_deref().unwrap_or("")),
+        );
         user.push_str(&format!(
             "<chat_message role=\"{}\" sender=\"{}\" name=\"{}\">{}</chat_message>\n",
             if message.from_self {
@@ -850,7 +858,7 @@ fn summary_prompt(history: &[StoredMessage]) -> (String, String) {
             },
             escape(message.sender.as_str()),
             escape(name),
-            escape(message.text.as_deref().unwrap_or("")),
+            text,
         ));
     }
     (system, user)

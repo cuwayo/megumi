@@ -181,6 +181,12 @@ memory of the chat, and — when `TAVILY_API_KEY` is set — the web. It runs at
 a few lookups per turn before it must answer, and every lookup is recorded in the
 turn log.
 
+Media is read too. With `MEDIA_API_KEY` (or `OPENAI_API_KEY`) set, a voice note
+is transcribed and an image is described, and that text joins the message's
+history — so the agent can answer about it and remember it. Without the key,
+media reaches the model as its kind alone, which is the behaviour before media
+understanding existed.
+
 Without the key the agent still runs and stores each chat's history, it just
 never replies; a warning says so at startup. History and a replayable log of
 every turn live under `AGENT_DIR` (default `agent/`, gitignored).
@@ -217,6 +223,13 @@ optional; without the file the bot runs with sticker-pack conversion disabled.
 | `AGENT_MAX_TOOL_ITERATIONS` | `3` | Tool calls a turn may make before it must answer; `0` disables tools |
 | `TAVILY_API_KEY` | unset | Enables the agent's `web_search` tool |
 | `TAVILY_API_BASE` | `https://api.tavily.com` | Web-search API base; override for a proxy |
+| `MEDIA_API_KEY` | unset | Enables media understanding (voice-note transcription, image description); `OPENAI_API_KEY` is an accepted fallback |
+| `MEDIA_API_BASE` | `https://api.openai.com/v1` | Transcription/vision API base; point it at any OpenAI-compatible host |
+| `MEDIA_TRANSCRIBE_MODEL` | `whisper-1` | Model a voice note is transcribed with |
+| `MEDIA_VISION_MODEL` | `gpt-4o-mini` | Model an image is described with |
+| `MEDIA_MAX_CHARS` | `1000` | Most characters of a description kept |
+| `MEDIA_MAX_TOKENS` | `300` | Most tokens an image description may use |
+| `MEDIA_MAX_BYTES` | `20000000` | Largest media file sent for description |
 | `AGENT_WEB_SEARCH_RESULTS` | `5` | Results a web search asks for |
 | `AGENT_WEB_SEARCH_MAX_CHARS` | `4000` | Characters of web-search results handed to the model |
 | `AGENT_PLANNING_ENABLED` | `true` | Whether a turn plans before it answers |

@@ -82,7 +82,18 @@ pub fn decide(event: &InboundEvent) -> GateDecision {
             }
         }
         ChatType::Private => {
-            if event.trimmed_text().is_empty() && event.attachments.is_empty() {
+            // A message the adapter understood is answered even with no text of
+            // its own: a voice note or image the agent can read is a question,
+            // not a bare attachment. An attachment the adapter could not
+            // describe is not — it falls through to the empty/acknowledgement
+            // checks, exactly as before media understanding existed.
+            let understood = event
+                .attachments
+                .iter()
+                .any(|attachment| attachment.description.is_some());
+            if understood {
+                Respond(Trigger::PrivateMessage)
+            } else if event.trimmed_text().is_empty() && event.attachments.is_empty() {
                 StaySilent(SilenceReason::Empty)
             } else if is_acknowledgement(event.trimmed_text()) {
                 StaySilent(SilenceReason::Acknowledgement)
@@ -230,5 +241,29 @@ mod tests {
             decide(&event(ChatType::Private, Some("   "))),
             GateDecision::StaySilent(SilenceReason::Empty)
         );
+    }
+
+    #[test]
+    fn a_private_message_with_only_an_understood_attachment_is_answered() {
+        let mut described = event(ChatType::Private, None);
+        described.attachments = vec![crate::event::Attachment {
+            kind: "audio".into(),
+            description: Some("what time is the meeting?".into()),
+        }];
+        assert_eq!(
+            decide(&described),
+            GateDecision::Respond(Trigger::PrivateMessage)
+        );
+    }
+
+    #[test]
+    fn a_private_message_with_an_undescribed_attachment_stays_silent() {
+        // Without a media provider a bare voice note is still nothing to answer.
+        let mut bare = event(ChatType::Private, None);
+        bare.attachments = vec![crate::event::Attachment {
+            kind: "sticker".into(),
+            description: None,
+        }];
+        assert!(matches!(decide(&bare), GateDecision::StaySilent(_)));
     }
 }

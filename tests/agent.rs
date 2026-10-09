@@ -41,6 +41,7 @@ fn data() -> Data {
         reminders: Arc::new(ReminderStore::open(":memory:").unwrap()),
         remind_task: tokio::sync::Mutex::new(None),
         agent,
+        media: None,
     }
 }
 
@@ -178,7 +179,7 @@ async fn a_commands_event_matches_the_adapters() {
     let inbound = batch.iter().next().expect("one message");
 
     let own: Vec<Jid> = [client.pn(), client.lid()].into_iter().flatten().collect();
-    let from_inbound = megumi_whatsapp::agent::inbound_event(inbound, &own, &client).await;
+    let from_inbound = megumi_whatsapp::agent::inbound_event(inbound, &own, &client, None).await;
 
     let context = whatsapp_rust::bot::MessageContext::from_inbound(inbound, Arc::clone(&client));
     let from_context = megumi_whatsapp::agent::event_from_context(&context).await;

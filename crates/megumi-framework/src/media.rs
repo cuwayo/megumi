@@ -101,13 +101,18 @@ enum Media<'a> {
 impl<'a> Attachment<'a> {
     /// The media `message` carries, or the media of the message it quotes.
     pub fn from_message(message: &'a wa::Message) -> Option<Self> {
-        Self::on(message).or_else(|| {
-            quoted_message(message).and_then(|quoted| Self::on(quoted.get_base_message()))
+        Self::own(message).or_else(|| {
+            quoted_message(message).and_then(|quoted| Self::own(quoted.get_base_message()))
         })
     }
 
     /// The media `message` itself carries, if it carries any.
-    fn on(message: &'a wa::Message) -> Option<Self> {
+    ///
+    /// Unlike [`from_message`](Self::from_message) this does not fall back to a
+    /// quoted message. A caller that must describe only what *this* message
+    /// carried — so a quoted image is not attributed to the reply quoting it —
+    /// uses this one.
+    pub fn own(message: &'a wa::Message) -> Option<Self> {
         let media = if let Some(image) = message.image_message.as_option() {
             Media::Image(image)
         } else if let Some(video) = message.video_message.as_option() {
@@ -175,7 +180,10 @@ impl<'a> Attachment<'a> {
     }
 
     /// The CDN references [`Context::download`] fetches this media with.
-    pub(crate) fn downloadable(&self) -> &dyn Downloadable {
+    ///
+    /// Public so a caller holding a raw client and message — the agent adapter,
+    /// which has no [`Context`] — can fetch the bytes itself.
+    pub fn downloadable(&self) -> &dyn Downloadable {
         match &self.media {
             Media::Image(image) => *image,
             Media::Video(video) => *video,

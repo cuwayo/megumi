@@ -34,12 +34,19 @@ fn agent(
     let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
     let mut config = AgentConfig::for_test();
     tweak(&mut config);
+    // `search_memory` is registered over the agent's own memory store, the way
+    // the bot wires it, so a turn with tools on actually offers one — the
+    // contrast the tool-free reasoning calls are asserted against.
+    let tools: Vec<Arc<dyn megumi_agent::Tool>> = vec![Arc::new(megumi_agent::SearchMemory::new(
+        Arc::clone(&memory),
+        config.clone(),
+    ))];
     let agent = Agent::new(
         store,
         memory,
         traces,
         llm.clone(),
-        Arc::new(ToolRegistry::new(Vec::new())),
+        Arc::new(ToolRegistry::new(tools)),
         config,
     );
     (agent, llm)

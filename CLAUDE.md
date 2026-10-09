@@ -213,15 +213,16 @@ hook is set, the framework subscribes to every event kind, not just `Messages`; 
 `whatsapp-rust`. `src/agent/` is the only place that knows both, converting `whatsapp_rust` messages into
 `megumi_agent::InboundEvent`s and sending the `OutboundAction`s back; `src/agent/media.rs` is the optional
 OpenAI-compatible provider that transcribes a voice note or describes an image before the event is built
-(the adapter, not the core, reads media — milestone 10). The pipeline is: store every message →
+(the adapter, not the core, reads media — milestone 10); `src/agent/tools.rs` holds the bot-side tools that
+need one of the bot's own stores (`SetReminder` writes to the reminder store — milestone 11). The pipeline is: store every message →
 gate (whether to speak) → build a budgeted, trust-tagged prompt → call the model, running any tool calls →
 record a trace. Modules:
 `event` (types), `config` (`AgentConfig`), `store` (per-chat JSON history, one file per chat, bounded
 window), `queues` (one turn at a time per chat), `gate` (pure trigger decision), `context` (the prompt
 builder and the `ReaderContext`/`Visibility` privacy boundary), `memory` (durable facts: `store` records +
 JSON store, `writer` extraction, `reflection`/`consolidate` insights and dedup, `retrieval` ranking),
-`tools` (the `Tool` trait, `ToolRegistry`, and the
-`WebSearch` tool), `safety` (the output guard `screen_reply` and the confirmation gate
+`tools` (the `Tool` trait, `ToolContext`, `ToolRegistry`, and the
+`SearchMemory`/`WebSearch` tools), `safety` (the output guard `screen_reply` and the confirmation gate
 `PendingConfirmations`), `reasoning` (the planner and the evaluator that bracket a turn), `llm` (the
 `LlmClient` trait, the Anthropic client, and test doubles), `trace`
 (replayable turn log), `agent` (`Agent::ingest` and `Agent::respond`).
@@ -233,10 +234,12 @@ JSON store, `writer` extraction, `reflection`/`consolidate` insights and dedup, 
 `ReaderContext` before ranking. v1 similarity is lexical (the provider has no embeddings endpoint). See
 `docs/AGENT.md` for the decisions that must not regress.
 
-**The tool loop (milestone 5)** is `run_turn`: it calls the model with `search_memory` (built per turn from
-the reader, so it filters through `retrieval::search`) plus the registry's reader-independent tools
-(`web_search`, present only with `TAVILY_API_KEY`), runs any calls, appends the results, and repeats up to
-`max_tool_iterations` — the last iteration only answers. `LlmMessage` is the three-shape turn (text, tool
+**The tool loop (milestone 5)** is `run_turn`: it advertises the registry's tools — `search_memory`
+(`SearchMemory`, over the agent's memory store, so it filters through `retrieval::search`), `web_search`
+(present only with `TAVILY_API_KEY`), and any the bot adds — runs any calls, appends the results, and repeats
+up to `max_tool_iterations` — the last iteration only answers. Each call is handed a `ToolContext` built
+from the turn's `ReaderContext`, so a tool that acts on the conversation knows the chat and the reader while
+the registry stays shared across chats. `LlmMessage` is the three-shape turn (text, tool
 calls, tool results) the Messages API needs, and both the Anthropic `tool_use` and OpenAI `tool_calls`
 shapes parse into it. Tool calls are recorded on the turn's `TurnTrace`. A tool failure is a result handed
 back to the model, never a failed turn, and the extraction pass sends no tools so its request is unchanged.
@@ -246,7 +249,7 @@ sendable: it drops an empty/`NO_REPLY` reply, one carrying the prompt's own trus
 system prompt, then truncates to `max_reply_chars`. `Tool::confirmation` returns the question to ask before
 a state-changing tool runs; the agent **holds** such a call, asks the chat, and runs it only in a separate
 turn after the user's "yes" (`PendingConfirmations`, per chat, in memory, expiring after
-`confirmation_ttl`). `run_turn` takes an optional seed so that confirmation turn reuses the same loop, trace,
+`confirmation_ttl`). The bot's `SetReminder` is the first production tool to use this gate. `run_turn` takes an optional seed so that confirmation turn reuses the same loop, trace,
 and guard. The confirmation answer is resolved *before* `gate::decide`, so a private "ok" is not swallowed
 as an acknowledgement — and in a group only a message directed at the bot (mention or reply) can answer it.
 

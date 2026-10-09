@@ -13,6 +13,7 @@
 //! phone number when it can and keeps the other form alongside.
 
 pub mod media;
+pub mod tools;
 
 use std::sync::Arc;
 

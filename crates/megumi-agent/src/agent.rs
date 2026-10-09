@@ -12,25 +12,18 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::config::AgentConfig;
-use crate::context::{
-    ContextBuilder, Prompt, ReaderContext, attachment_note, escape, render_memory, truncate,
-};
+use crate::context::{ContextBuilder, Prompt, ReaderContext, attachment_note, escape, truncate};
 use crate::event::{ChatId, ChatType, InboundEvent, OutboundAction};
 use crate::gate::{self, GateDecision, Trigger};
-use crate::llm::{
-    LlmClient, LlmError, LlmMessage, LlmRequest, LlmToolCall, LlmToolResult, ToolSpec,
-};
+use crate::llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmToolCall, LlmToolResult};
 use crate::memory::store::{MemoryOp, MemoryRecord};
 use crate::memory::{MemoryStore, reflection, retrieval, writer};
 use crate::queues::ChatQueues;
 use crate::reasoning::{self, Usage};
 use crate::safety::{self, Confirmation, PendingConfirmations, PendingToolCall};
 use crate::store::{MessageStore, StoredMessage};
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolContext, ToolRegistry};
 use crate::trace::{self, ToolCallTrace, TraceSink, TurnTrace};
-
-/// The name of the per-turn memory-search tool.
-const SEARCH_MEMORY: &str = "search_memory";
 
 /// The reply a code path sends when the user declines a held tool call.
 const CANCELLED: &str = "Okay, cancelled.";
@@ -520,14 +513,17 @@ impl Agent {
         seed_calls: Vec<ToolCallTrace>,
         allow_tools: bool,
     ) -> TurnOutcome {
-        // The tools the model may call this turn: the reader-bound memory
-        // search, then the registry's reader-independent tools. A seeded turn
-        // advertises none — it only narrates or rewrites what it was handed.
+        // The tools the model may call this turn. A seeded turn advertises none
+        // — it only narrates or rewrites what it was handed.
         let tools = if allow_tools {
-            self.turn_tools()
+            self.tools.specs()
         } else {
             Vec::new()
         };
+        // The turn's identity, handed to every tool call. The registry is shared
+        // across chats, so a tool that acts on this conversation reads the chat
+        // and reader from here.
+        let context = ToolContext::new(reader.clone());
 
         let mut messages = vec![LlmMessage::Text {
             assistant: false,
@@ -612,7 +608,7 @@ impl Agent {
             // The model asked for tools. Run each, record it, and feed the
             // results back as the next turn's input.
             let results = self
-                .run_tool_calls(reader, &response.tool_calls, &mut calls)
+                .run_tool_calls(&context, &response.tool_calls, &mut calls)
                 .await;
             messages.push(LlmMessage::ToolCalls(response.tool_calls));
             messages.push(LlmMessage::ToolResults(results));
@@ -639,8 +635,11 @@ impl Agent {
     ) -> Result<Option<OutboundAction>, crate::Error> {
         let arguments: serde_json::Value =
             serde_json::from_str(&pending.arguments).unwrap_or(serde_json::json!({}));
+        // The held call runs with the same turn context it was held under, so a
+        // tool that acts on the chat still knows which chat that is.
+        let context = ToolContext::for_event(event);
         let result = match self.tools.get(&pending.name) {
-            Some(tool) => tool.call(&arguments).await,
+            Some(tool) => tool.call(&context, &arguments).await,
             None => Err(format!("no tool named `{}`", pending.name)),
         };
         let content = match result {
@@ -670,27 +669,16 @@ impl Agent {
 
     /// The confirmation question a tool call needs, or `None` when it may run.
     ///
-    /// `search_memory` is never consequential — it only reads — so it is not in
-    /// the registry and needs no check. Any other call is looked up and asked.
+    /// Every tool decides for itself: a read-only tool leaves
+    /// [`Tool::confirmation`](crate::tools::Tool::confirmation) at its `None`
+    /// default, a state-changing one overrides it. The registry is asked, so a
+    /// call the model invented needs no confirmation because it will not run at
+    /// all.
     fn confirmation_for(&self, call: &LlmToolCall) -> Option<String> {
-        if call.name == SEARCH_MEMORY {
-            return None;
-        }
         let tool = self.tools.get(&call.name)?;
         let arguments: serde_json::Value =
             serde_json::from_str(&call.arguments).unwrap_or(serde_json::json!({}));
         tool.confirmation(&arguments)
-    }
-
-    /// The tools a turn may call: the reader-bound memory search first, then
-    /// the registry's.
-    fn turn_tools(&self) -> Vec<ToolSpec> {
-        let mut tools = Vec::new();
-        if self.config.max_tool_iterations > 0 {
-            tools.push(memory_tool_spec());
-            tools.extend(self.tools.specs());
-        }
-        tools
     }
 
     /// Runs every tool call `calls` asked for, recording each and returning the
@@ -700,7 +688,7 @@ impl Agent {
     /// failing the turn, so the model can still answer around it.
     async fn run_tool_calls(
         &self,
-        reader: &ReaderContext,
+        context: &ToolContext,
         calls: &[LlmToolCall],
         recorded: &mut Vec<ToolCallTrace>,
     ) -> Vec<LlmToolResult> {
@@ -708,12 +696,9 @@ impl Agent {
         for call in calls {
             let arguments: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or(serde_json::json!({}));
-            let result = if call.name == SEARCH_MEMORY {
-                self.search_memory(reader, &arguments)
-            } else if let Some(tool) = self.tools.get(&call.name) {
-                tool.call(&arguments).await
-            } else {
-                Err(format!("no tool named `{}`", call.name))
+            let result = match self.tools.get(&call.name) {
+                Some(tool) => tool.call(context, &arguments).await,
+                None => Err(format!("no tool named `{}`", call.name)),
             };
             let content = match result {
                 Ok(content) => content,
@@ -730,33 +715,6 @@ impl Agent {
             });
         }
         results
-    }
-
-    /// The `search_memory` tool: the facts `reader` may see for a query.
-    fn search_memory(
-        &self,
-        reader: &ReaderContext,
-        arguments: &serde_json::Value,
-    ) -> Result<String, String> {
-        let query = arguments
-            .get("query")
-            .and_then(|query| query.as_str())
-            .ok_or_else(|| "search_memory needs a `query` argument".to_string())?;
-        let memories = retrieval::search(
-            reader,
-            query,
-            &self.memory,
-            &self.config,
-            chrono::Utc::now(),
-        )?;
-        if memories.is_empty() {
-            return Ok("No stored facts matched.".to_string());
-        }
-        Ok(memories
-            .iter()
-            .map(render_memory)
-            .collect::<Vec<_>>()
-            .join("\n"))
     }
 
     /// The message store, for tests and diagnostics.
@@ -862,30 +820,6 @@ fn summary_prompt(history: &[StoredMessage]) -> (String, String) {
         ));
     }
     (system, user)
-}
-
-/// The spec of the per-turn `search_memory` tool.
-///
-/// The tool is not in the registry because its result depends on the turn's
-/// reader, which the registry does not have; the spec itself is reader-free.
-fn memory_tool_spec() -> ToolSpec {
-    ToolSpec {
-        name: SEARCH_MEMORY.to_string(),
-        description: "Search the facts this conversation has stored about people, places, \
-                      plans, and preferences. Use it when the answer may depend on something \
-                      said earlier that is no longer in the recent messages."
-            .to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "What to look up in memory."
-                }
-            },
-            "required": ["query"]
-        }),
-    }
 }
 
 #[cfg(test)]

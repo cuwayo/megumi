@@ -58,7 +58,7 @@ pub fn framework() -> Framework<Data> {
     let reminders =
         Arc::new(ReminderStore::open(reminder_path).unwrap_or_else(|error| panic!("{error}")));
     let started = Instant::now();
-    let agent = build_agent();
+    let agent = build_agent(Arc::clone(&reminders));
     // The media-understanding provider is optional: without a credential it is
     // `None` and the adapter describes nothing, so media reaches the model as
     // its kind alone.
@@ -104,8 +104,9 @@ pub fn framework() -> Framework<Data> {
 /// The message store, the memory store, and the trace log are opened here, so a
 /// corrupt file fails startup. The model is optional: without
 /// `ANTHROPIC_API_KEY` the agent still stores every message but cannot reply,
-/// and that is a warning, not an error.
-fn build_agent() -> Arc<megumi_agent::Agent> {
+/// and that is a warning, not an error. `reminders` is the bot's own store, so
+/// the agent's `set_reminder` tool can schedule into it.
+fn build_agent(reminders: Arc<ReminderStore>) -> Arc<megumi_agent::Agent> {
     let config = megumi_agent::AgentConfig::from_env();
 
     let store = Arc::new(
@@ -133,9 +134,15 @@ fn build_agent() -> Arc<megumi_agent::Agent> {
             }
         };
 
-    // Web search is optional: without `TAVILY_API_KEY` the tool is simply
-    // absent, and `search_memory` is the only tool a turn may call.
-    let mut tools: Vec<Arc<dyn megumi_agent::Tool>> = Vec::new();
+    // `search_memory` is registered over the agent's own memory store, so a turn
+    // may recall facts through the same privacy boundary the prompt uses.
+    let mut tools: Vec<Arc<dyn megumi_agent::Tool>> = vec![Arc::new(
+        megumi_agent::SearchMemory::new(Arc::clone(&memory), config.clone()),
+    )];
+    // `set_reminder` writes to the bot's reminder store, and is state-changing,
+    // so the agent holds its calls for a confirmation.
+    tools.push(Arc::new(agent::tools::SetReminder::new(reminders)));
+    // Web search is optional: without `TAVILY_API_KEY` the tool is simply absent.
     if let Some(web_search) = megumi_agent::WebSearch::from_env(&config) {
         tools.push(Arc::new(web_search));
     }

@@ -24,7 +24,8 @@
 //! - `memory` - durable facts: the store, the extraction writer, the
 //!   consolidation/reflection passes, and retrieval
 //! - `llm` - the [`LlmClient`] trait, the Anthropic client, and test doubles
-//! - `tools` - the [`Tool`] trait, [`ToolRegistry`], and the web-search tool
+//! - `tools` - the [`Tool`] trait, [`ToolContext`], [`ToolRegistry`], and the
+//!   built-in memory-search and web-search tools
 //! - `safety` - the output guard and the confirmation gate for tools
 //! - `reasoning` - the planner and the evaluator that bracket a turn
 //! - `trace` - the replayable record of every turn
@@ -67,5 +68,5 @@ pub use memory::{MemoryKind, MemoryOp, MemoryRecord, MemoryStore};
 pub use queues::ChatQueues;
 pub use safety::{Confirmation, PendingConfirmations, PendingToolCall};
 pub use store::{MessageStore, StoredMessage};
-pub use tools::{Tool, ToolRegistry, WebSearch};
+pub use tools::{SEARCH_MEMORY, SearchMemory, Tool, ToolContext, ToolRegistry, WebSearch};
 pub use trace::{ToolCallTrace, TraceSink, TurnTrace};

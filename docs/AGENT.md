@@ -10,7 +10,7 @@ memory, context, reasoning, tools, safety, evals). We are implementing it in the
 milestones that spec lays out, and its own rule applies: **do not start a later
 milestone until the earlier one's exit criteria pass.**
 
-## What is built (milestones 1–9)
+## What is built (milestones 1–11)
 
 | Milestone | Status |
 |---|---|
@@ -24,6 +24,7 @@ milestone until the earlier one's exit criteria pass.**
 | 8. Planner/evaluator | **done** (plan before, evaluate + bounded revise after) |
 | 9. Consolidation, reflections, tuning | **done** (reflections, dedup, tunable weights) |
 | 10. Media understanding (voice transcription + image description) | **done** (adapter-side, OpenAI-compatible, optional) |
+| 11. Tool context + the first consequential tool | **done** (`ToolContext`; `search_memory` as a real tool; `set_reminder` behind the confirmation gate) |
 
 ### Where things live
 
@@ -34,8 +35,8 @@ milestone until the earlier one's exit criteria pass.**
   store), `writer` (extraction), `reflection` (consolidation into insights),
   `consolidate` (duplicate suppression), `retrieval` (ranking behind the privacy
   filter).
-- `crates/megumi-agent/src/tools.rs` — the `Tool` trait, the `ToolRegistry`, and
-  the `WebSearch` tool.
+- `crates/megumi-agent/src/tools.rs` — the `Tool` trait, `ToolContext`, the
+  `ToolRegistry`, and the `SearchMemory` and `WebSearch` tools.
 - `crates/megumi-agent/src/safety.rs` — the output guard, the confirmation gate,
   and the pending-confirmation store.
 - `crates/megumi-agent/src/reasoning.rs` — the planner and the evaluator, the two
@@ -45,6 +46,9 @@ milestone until the earlier one's exit criteria pass.**
   shared core both a live message and a command's `MessageContext` go through.
 - `src/agent/media.rs` — the optional OpenAI-compatible media provider the
   adapter transcribes voice notes and describes images with (milestone 10).
+- `src/agent/tools.rs` — the bot-side tools that need one of the bot's stores;
+  `SetReminder` schedules into the reminder store and is held for a confirmation
+  (milestone 11).
 - `src/commands/{ask,summary,memory,forget,remind}/` — the assistant commands
   (the `assistant` group), the deterministic entry points to the agent.
 - `src/reminders/` — `!remind`'s store, duration parser, and scheduler loop
@@ -102,6 +106,13 @@ These were chosen deliberately; a later change that breaks one is a regression.
     existed. The adapter reads only the message's *own* media
     (`Attachment::own`), never a quoted message's, so a text reply to an image
     does not get the image's description attributed to it.
+11. **A tool learns which turn it is in from the `ToolContext`, never from global
+    state.** The registry is shared across every chat, so a tool that acts on the
+    conversation reads the chat and the reader from the context the agent hands
+    `Tool::call`. A confirmation turn is built with `ToolContext::for_event`, so a
+    held call runs against the chat it was held in. The `search_memory` tool reads
+    memory through that context's reader, so the privacy boundary holds on the
+    tool path exactly as it does on the prompt path.
 
 ## How to run and verify
 
@@ -453,13 +464,61 @@ duplicated and a provider failure degrades to the kind alone. The adapter reads
 only the message's own media. The description is untrusted, so it is escaped like
 any other text and rendered as a plain prefix, not a trust tag.
 
+## Milestone 11 — the tool context and the first consequential tool (done)
+
+Goal: let a tool act on the conversation it was called in, and finally exercise
+the milestone-6 confirmation gate with a real tool. Before this, the registry was
+shared across every chat but a tool had no way to know which chat it was in — the
+one reader-dependent tool (`search_memory`) was special-cased inside the agent —
+and the only production tool, `web_search`, was read-only, so the hold-and-confirm
+machinery had never run outside a test double. Built in
+`crates/megumi-agent/src/tools.rs` and `src/agent/tools.rs`:
+
+- **`ToolContext`** (`tools.rs`) wraps the turn's `ReaderContext`, exposing
+  `chat()`, `chat_type()`, `sender()`, and `reader()`.
+  It is built fresh per turn in `Agent::model_loop` and handed to every
+  `Tool::call`, so the registry stays shared while a tool still knows the chat
+  and the reader. A confirmation turn builds the same context
+  (`ToolContext::for_event`), so a held call runs against the chat it was held in.
+- **`Tool::call` gained the context parameter.** Every tool now takes
+  `(&ToolContext, &serde_json::Value)`.
+- **`SearchMemory` is a normal registry tool** holding `Arc<MemoryStore>` +
+  `AgentConfig`. It reads through `retrieval::search` with the turn's reader, so
+  the privacy boundary holds on the tool path exactly as it does on the prompt
+  path. The agent's `search_memory` special case — the `SEARCH_MEMORY` constant in
+  `agent.rs`, `memory_tool_spec`, `Agent::search_memory`, and the branch in
+  `confirmation_for` — is gone; the tool is registered like any other.
+- **`SetReminder`** (`src/agent/tools.rs`) holds `Arc<ReminderStore>` and, on a
+  call, parses the model's `delay` with the reminder parser and schedules the
+  reminder **in the turn's chat** (`context.chat()`). It overrides
+  `Tool::confirmation`, so the agent holds the call and runs it only after the
+  user's "yes" — the milestone-6 gate, now driven by a real tool. `build_agent`
+  registers `SearchMemory` and `SetReminder` (and `web_search` when
+  `TAVILY_API_KEY` is set).
+- Evals: `crates/megumi-agent/tests/tools.rs` (the memory search reads through the
+  turn context and cannot cross the privacy boundary; a confirmed call runs in the
+  turn's chat) and `tests/agent.rs` in the bot crate (a `set_reminder` call is held
+  — the store stays empty — and the user's "yes" writes the reminder into the bot's
+  store, traced as a confirmation turn), plus unit tests in `tools.rs` and
+  `src/agent/tools.rs`.
+
+**Do not regress:** a tool reads the chat and the reader from the `ToolContext`,
+never from global state, so the registry stays safe to share across chats. A
+confirmation turn is built with `ToolContext::for_event`, so a held call runs
+against the chat it was held in, not whichever message answered it. `SearchMemory`
+still reads through `retrieval::search`, so the private-to-group boundary holds on
+the tool path. `set_reminder` is the tool that owns the confirmation decision —
+the model cannot talk past it — and it schedules only into the turn's chat.
+
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
 2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,reasoning,store}.rs`
    to see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Milestones 1–10 are done. The original design spec is not in the repo, so any
-   further work is a new interpretation: extend the evals, tune the reflection,
-   retrieval, and media knobs against real traffic, or add video/document
-   understanding to the adapter's `media` seam.
+4. Milestones 1–11 are done. The original design spec is not in the repo, so any
+   further work is a new interpretation: add more bot-side tools (a `set_reminder`
+   is the template — a store the bot owns, plus a `confirmation` when it changes
+   state), extend the evals, tune the reflection, retrieval, and media knobs
+   against real traffic, or add video/document understanding to the adapter's
+   `media` seam.

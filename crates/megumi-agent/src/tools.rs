@@ -3,32 +3,77 @@
 //! A tool is a named capability the model can ask for mid-turn: it advertises a
 //! [`ToolSpec`] (a name, a description, and a JSON Schema of its arguments) and,
 //! when called, returns a short text result the model reasons over. Two tools
-//! exist so far: `search_memory`, which is built per turn from the reader's
-//! [`ReaderContext`](crate::context::ReaderContext) so the privacy boundary
-//! holds, and `web_search`, which is reader-independent and lives in the
-//! registry.
+//! live here: [`SearchMemory`], which reads a chat's facts through the turn's
+//! privacy boundary, and [`WebSearch`], which reads the web. Both are ordinary
+//! registry entries; a tool that needs to know *which* turn it is in — the chat,
+//! the asker, the reader — takes that from the [`ToolContext`] the agent passes
+//! to [`Tool::call`], because the registry itself is shared across every chat.
 //!
-//! The registry is deliberately thin. It maps a name to a tool and advertises
-//! every spec; the per-turn `search_memory` tool is not in it because it needs
-//! the turn's reader, which the registry does not have.
+//! The registry is deliberately thin: it maps a name to a tool and advertises
+//! every spec.
 
 use std::sync::Arc;
 
 use serde::Deserialize;
 
 use crate::config::AgentConfig;
-use crate::context::truncate;
+use crate::context::{ReaderContext, render_memory, truncate};
+use crate::event::{ChatId, InboundEvent};
 use crate::llm::{BoxFuture, ToolSpec};
+use crate::memory::{MemoryStore, retrieval};
+
+/// The turn a tool is running in: which chat it was called in, and the privacy
+/// boundary memory reads pass through.
+///
+/// The registry is shared across every chat and turn, so it cannot carry the
+/// turn's identity; this is built fresh for each turn and handed to
+/// [`Tool::call`]. A tool that acts on the conversation — sets a reminder in
+/// this chat — reads the chat here. It wraps the turn's [`ReaderContext`], so a
+/// tool that reads memory reads it through the same filter the prompt does, and
+/// the private-to-group boundary holds on the tool path too.
+#[derive(Clone, Debug)]
+pub struct ToolContext {
+    reader: ReaderContext,
+}
+
+impl ToolContext {
+    /// A context over an already-built reader.
+    pub fn new(reader: ReaderContext) -> Self {
+        Self { reader }
+    }
+
+    /// The context of a turn triggered by `event`.
+    pub fn for_event(event: &InboundEvent) -> Self {
+        Self::new(ReaderContext::for_event(event))
+    }
+
+    /// The privacy boundary and identity of the turn.
+    pub fn reader(&self) -> &ReaderContext {
+        &self.reader
+    }
+
+    /// The chat the tool was called in.
+    pub fn chat(&self) -> &ChatId {
+        &self.reader.chat
+    }
+}
 
 /// A capability the model may call by name.
 pub trait Tool: Send + Sync {
     /// What the model is told about this tool.
     fn spec(&self) -> ToolSpec;
-    /// Runs the tool with the model's arguments, returning text or an error.
+    /// Runs the tool with the turn's `context` and the model's arguments,
+    /// returning text or an error.
     ///
-    /// A failure is a string, not a panic: the agent hands it back to the model
-    /// as the call's result so the turn can still answer.
-    fn call(&self, arguments: &serde_json::Value) -> BoxFuture<Result<String, String>>;
+    /// The context carries the chat and the reader, so a tool can act on the
+    /// conversation it was called in. A failure is a string, not a panic: the
+    /// agent hands it back to the model as the call's result so the turn can
+    /// still answer.
+    fn call(
+        &self,
+        context: &ToolContext,
+        arguments: &serde_json::Value,
+    ) -> BoxFuture<Result<String, String>>;
 
     /// The question to ask the chat before running this tool, or `None` when it
     /// is safe to run on the model's word alone.
@@ -43,7 +88,7 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// The reader-independent tools a turn may call.
+/// The tools a turn may call, by name.
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
@@ -66,6 +111,82 @@ impl ToolRegistry {
             .iter()
             .find(|tool| tool.spec().name == name)
             .cloned()
+    }
+}
+
+/// The name of the memory-search tool.
+///
+/// The tool registers itself under this name; a test that asserts on the
+/// advertised tool, or a caller that wants to recognise it, compares against
+/// this rather than repeating the literal.
+pub const SEARCH_MEMORY: &str = "search_memory";
+
+/// The memory-search tool: the facts the turn's reader may see for a query.
+///
+/// It reads through [`retrieval::search`], so it filters by the turn's
+/// [`ReaderContext`] before it ranks — the same boundary the prompt uses. A fact
+/// the prompt would not show cannot be reached through the tool either. It is
+/// read-only, so it needs no confirmation.
+pub struct SearchMemory {
+    store: Arc<MemoryStore>,
+    config: AgentConfig,
+}
+
+impl SearchMemory {
+    /// A tool over `store`, ranking with `config`.
+    pub fn new(store: Arc<MemoryStore>, config: AgentConfig) -> Self {
+        Self { store, config }
+    }
+}
+
+impl Tool for SearchMemory {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: SEARCH_MEMORY.to_string(),
+            description: "Search the facts this conversation has stored about people, places, \
+                          plans, and preferences. Use it when the answer may depend on something \
+                          said earlier that is no longer in the recent messages."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to look up in memory."
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    fn call(
+        &self,
+        context: &ToolContext,
+        arguments: &serde_json::Value,
+    ) -> BoxFuture<Result<String, String>> {
+        // The future is `'static`, so it owns the query and clones what it needs
+        // rather than borrowing the arguments or the tool.
+        let query = arguments
+            .get("query")
+            .and_then(|query| query.as_str())
+            .map(str::to_string);
+        let reader = context.reader().clone();
+        let store = Arc::clone(&self.store);
+        let config = self.config.clone();
+        Box::pin(async move {
+            let query =
+                query.ok_or_else(|| "search_memory needs a `query` argument".to_string())?;
+            let memories = retrieval::search(&reader, &query, &store, &config, chrono::Utc::now())?;
+            if memories.is_empty() {
+                return Ok("No stored facts matched.".to_string());
+            }
+            Ok(memories
+                .iter()
+                .map(render_memory)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        })
     }
 }
 
@@ -140,7 +261,11 @@ impl Tool for WebSearch {
         }
     }
 
-    fn call(&self, arguments: &serde_json::Value) -> BoxFuture<Result<String, String>> {
+    fn call(
+        &self,
+        _context: &ToolContext,
+        arguments: &serde_json::Value,
+    ) -> BoxFuture<Result<String, String>> {
         // The future is `'static`, so it owns everything rather than borrowing.
         let api_key = self.api_key.clone();
         let api_base = self.api_base.clone();
@@ -248,6 +373,70 @@ mod tests {
         let spec = tool.spec();
         assert_eq!(spec.name, "web_search");
         assert_eq!(spec.parameters["required"][0], "query");
+    }
+
+    #[test]
+    fn the_memory_search_spec_advertises_a_required_query() {
+        let tool = SearchMemory::new(
+            Arc::new(MemoryStore::open(":memory:").unwrap()),
+            AgentConfig::for_test(),
+        );
+        let spec = tool.spec();
+        assert_eq!(spec.name, SEARCH_MEMORY);
+        assert_eq!(spec.parameters["required"][0], "query");
+        // Read-only, so it never needs a confirmation.
+        assert!(tool.confirmation(&serde_json::json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_search_reads_through_the_turn_context() {
+        use crate::context::Visibility;
+        use crate::event::{ChatId, ChatType, SenderId};
+        use crate::memory::store::{MemoryOp, NewFact};
+
+        let store = Arc::new(MemoryStore::open(":memory:").unwrap());
+        store
+            .apply(
+                &ChatId::new("gA"),
+                &[MemoryOp::Add(NewFact {
+                    content: "The venue is the old hall.".into(),
+                    visibility: Visibility::Chat,
+                    subject: None,
+                    confidence: 0.9,
+                    importance: 0.5,
+                    valid_from: chrono::Utc::now(),
+                    evidence: vec!["m1".into()],
+                })],
+                None,
+            )
+            .unwrap();
+        let tool = SearchMemory::new(Arc::clone(&store), AgentConfig::for_test());
+
+        // The turn's context is a member of gA, so the group fact is visible.
+        let in_group = ToolContext::new(ReaderContext {
+            chat: ChatId::new("gA"),
+            chat_type: ChatType::Group,
+            requester: SenderId::new("u1"),
+            member_of: vec![ChatId::new("gA")],
+        });
+        let result = tool
+            .call(&in_group, &serde_json::json!({ "query": "venue" }))
+            .await
+            .unwrap();
+        assert!(result.contains("old hall"), "{result}");
+
+        // A different group cannot see it.
+        let elsewhere = ToolContext::new(ReaderContext {
+            chat: ChatId::new("gB"),
+            chat_type: ChatType::Group,
+            requester: SenderId::new("u2"),
+            member_of: vec![ChatId::new("gB")],
+        });
+        let result = tool
+            .call(&elsewhere, &serde_json::json!({ "query": "venue" }))
+            .await
+            .unwrap();
+        assert_eq!(result, "No stored facts matched.");
     }
 
     #[test]

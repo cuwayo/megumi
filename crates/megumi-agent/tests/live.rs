@@ -11,7 +11,10 @@
 //! and `ANTHROPIC_MODEL`, so it exercises the same path the bot uses. The tool
 //! smoke test additionally reads `TAVILY_API_KEY` and `TAVILY_API_BASE`.
 
-use megumi_agent::{AgentConfig, AnthropicLlm, LlmClient, LlmRequest, Tool, WebSearch};
+use megumi_agent::{
+    AgentConfig, AnthropicLlm, ChatId, ChatType, LlmClient, LlmRequest, ReaderContext, SenderId,
+    Tool, ToolContext, WebSearch,
+};
 
 #[tokio::test]
 #[ignore = "needs a live model endpoint and credential"]
@@ -48,8 +51,19 @@ async fn the_configured_web_search_answers() {
     let config = AgentConfig::from_env();
     let tool = WebSearch::from_env(&config).expect("TAVILY_API_KEY must be set");
 
+    // A web search is reader-independent, so the context is not consulted; it is
+    // still supplied because every tool call takes one.
+    let context = ToolContext::new(ReaderContext {
+        chat: ChatId::new("live"),
+        chat_type: ChatType::Private,
+        requester: SenderId::new("live"),
+        member_of: Vec::new(),
+    });
     let result = tool
-        .call(&serde_json::json!({ "query": "who is the current secretary-general of the UN?" }))
+        .call(
+            &context,
+            &serde_json::json!({ "query": "who is the current secretary-general of the UN?" }),
+        )
         .await
         .expect("the web search should succeed");
 

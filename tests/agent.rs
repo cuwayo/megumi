@@ -10,8 +10,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use megumi_agent::{AgentConfig, MemoryStore, MessageStore, ScriptedLlm, ToolRegistry, TraceSink};
+use megumi_agent::{
+    AgentConfig, LlmResponse, LlmToolCall, MemoryStore, MessageStore, ScriptedLlm, Tool,
+    ToolRegistry, TraceSink,
+};
 use megumi_whatsapp::agent::on_messages;
+use megumi_whatsapp::agent::tools::SetReminder;
 use megumi_whatsapp::{Data, NewsStore, ReminderStore};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::types::events::{BatchOrigin, InboundMessage, MessageBatch};
@@ -43,6 +47,38 @@ fn data() -> Data {
         agent,
         media: None,
     }
+}
+
+/// Builds `Data` whose agent has tools on and a `set_reminder` tool over a fresh
+/// reminder store, driven by a scripted model. Returns the store so a test can
+/// assert on what the tool wrote.
+fn data_with_reminders(replies: Vec<LlmResponse>) -> (Data, Arc<ReminderStore>) {
+    let store = Arc::new(MessageStore::open(":memory:", 200).unwrap());
+    let memory = Arc::new(MemoryStore::open(":memory:").unwrap());
+    let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
+    let reminders = Arc::new(ReminderStore::open(":memory:").unwrap());
+    let llm = Arc::new(ScriptedLlm::new(replies));
+    let mut config = AgentConfig::for_test();
+    config.max_tool_iterations = 3;
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(SetReminder::new(Arc::clone(&reminders)))];
+    let agent = Arc::new(megumi_agent::Agent::new(
+        store,
+        memory,
+        traces,
+        llm,
+        Arc::new(ToolRegistry::new(tools)),
+        config,
+    ));
+    let data = Data {
+        started: Instant::now(),
+        news: Arc::new(NewsStore::open(":memory:").unwrap()),
+        news_task: tokio::sync::Mutex::new(None),
+        reminders: Arc::clone(&reminders),
+        remind_task: tokio::sync::Mutex::new(None),
+        agent,
+        media: None,
+    };
+    (data, reminders)
 }
 
 async fn client() -> Arc<Client> {
@@ -189,4 +225,64 @@ async fn a_commands_event_matches_the_adapters() {
     assert_eq!(from_inbound.sender, from_context.sender);
     assert_eq!(from_inbound.is_command, from_context.is_command);
     assert!(from_context.is_command);
+}
+
+/// A scripted reply that calls `set_reminder`.
+fn set_reminder_call() -> LlmResponse {
+    LlmResponse {
+        tool_calls: vec![LlmToolCall {
+            id: "call_1".into(),
+            name: "set_reminder".into(),
+            arguments: r#"{"delay":"10m","text":"take a break"}"#.into(),
+        }],
+        ..Default::default()
+    }
+}
+
+fn text_reply(text: &str) -> LlmResponse {
+    LlmResponse {
+        text: text.into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_reminder_tool_call_is_held_then_writes_to_the_bot_store() {
+    // The whole milestone in one flow, through the production wiring: the model
+    // asks to set a reminder, the agent holds the call (the store stays empty),
+    // and only the user's "yes" runs the tool — into the bot's own reminder
+    // store, in the chat the message came from.
+    let (data, reminders) = data_with_reminders(vec![
+        set_reminder_call(),
+        text_reply("Okay, I'll remind you."),
+    ]);
+    let client = client().await;
+
+    // A private message: the agent answers it, and the model calls the tool.
+    let ask = event(
+        "62812@s.whatsapp.net",
+        "62812@s.whatsapp.net",
+        "remind me to take a break in 10 minutes",
+        false,
+        false,
+    );
+    on_messages(&data, &client, &ask).await;
+
+    // Held, not run: nothing was scheduled and the chat got the question.
+    let chat = "62812@s.whatsapp.net";
+    assert!(reminders.list(chat).unwrap().is_empty());
+
+    // The user agrees. This time the tool runs and the reminder is stored.
+    let yes = event(chat, "62812@s.whatsapp.net", "yes", false, false);
+    on_messages(&data, &client, &yes).await;
+
+    let listed = reminders.list(chat).unwrap();
+    assert_eq!(listed.len(), 1, "the confirmed reminder must be stored");
+    assert_eq!(listed[0].text, "take a break");
+
+    // The confirmation turn is traced as such, with the tool call recorded.
+    let traces = data.agent.traces().recent(10).unwrap();
+    assert_eq!(traces.len(), 2);
+    assert_eq!(traces[1].trigger, "confirmation");
+    assert_eq!(traces[1].tool_calls[0].name, "set_reminder");
 }

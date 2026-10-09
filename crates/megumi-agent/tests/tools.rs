@@ -19,6 +19,9 @@ use megumi_agent::{
 /// Builds an agent with tools on and a registry of `tools`.
 ///
 /// `max_tool_iterations` is raised from `for_test`'s 0, so the loop runs.
+/// `search_memory` is registered first, over the agent's own memory store — the
+/// way the bot wires it — so the memory-loop tests exercise the real tool rather
+/// than a special case.
 fn agent(
     replies: Vec<LlmResponse>,
     tools: Vec<Arc<dyn Tool>>,
@@ -30,12 +33,19 @@ fn agent(
     let traces = Arc::new(TraceSink::open(":memory:", 500).unwrap());
     let mut config = AgentConfig::for_test();
     config.max_tool_iterations = max_tool_iterations;
+
+    let mut registry = vec![Arc::new(megumi_agent::SearchMemory::new(
+        Arc::clone(&memory),
+        config.clone(),
+    )) as Arc<dyn Tool>];
+    registry.extend(tools);
+
     let agent = Agent::new(
         store,
         memory,
         traces,
         llm.clone(),
-        Arc::new(ToolRegistry::new(tools)),
+        Arc::new(ToolRegistry::new(registry)),
         config,
     );
     (agent, llm)
@@ -237,6 +247,7 @@ impl Tool for FailingTool {
 
     fn call(
         &self,
+        _context: &megumi_agent::ToolContext,
         _arguments: &serde_json::Value,
     ) -> megumi_agent::llm::BoxFuture<Result<String, String>> {
         Box::pin(async { Err("the upstream service is down".to_string()) })
@@ -304,12 +315,15 @@ async fn tools_off_is_a_single_call_as_before() {
     );
 }
 
-/// A state-changing tool that records whether it ever ran.
+/// A state-changing tool that records whether it ever ran and which chat it saw.
 ///
 /// It overrides [`Tool::confirmation`], so the agent must hold the call and run
 /// it only after a "yes" — the flag is how a test proves it did not run early.
+/// It records the chat from the [`megumi_agent::ToolContext`], so a test can
+/// prove a held call runs against the same chat it was held in.
 struct ConsequentialTool {
     ran: Arc<AtomicBool>,
+    chat: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Tool for ConsequentialTool {
@@ -323,9 +337,11 @@ impl Tool for ConsequentialTool {
 
     fn call(
         &self,
+        context: &megumi_agent::ToolContext,
         _arguments: &serde_json::Value,
     ) -> megumi_agent::llm::BoxFuture<Result<String, String>> {
         self.ran.store(true, Ordering::SeqCst);
+        *self.chat.lock().unwrap() = Some(context.chat().as_str().to_string());
         Box::pin(async { Ok("the state was changed".to_string()) })
     }
 
@@ -347,14 +363,32 @@ fn state_call() -> LlmResponse {
 }
 
 /// An agent with the consequential tool registered, over `ran`.
+///
+/// The chat the tool saw is dropped; tests that care about it use
+/// [`consequential_agent_with_chat`].
 fn consequential_agent(ran: &Arc<AtomicBool>) -> (Agent, Arc<ScriptedLlm>) {
-    agent(
+    let (agent, llm, _chat) = consequential_agent_with_chat(ran);
+    (agent, llm)
+}
+
+/// The same, but returning the chat the tool was called in.
+fn consequential_agent_with_chat(
+    ran: &Arc<AtomicBool>,
+) -> (
+    Agent,
+    Arc<ScriptedLlm>,
+    Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let chat = Arc::new(std::sync::Mutex::new(None));
+    let (agent, llm) = agent(
         vec![state_call(), text_reply("Done, I changed it.")],
         vec![Arc::new(ConsequentialTool {
             ran: Arc::clone(ran),
+            chat: Arc::clone(&chat),
         })],
         3,
-    )
+    );
+    (agent, llm, chat)
 }
 
 #[tokio::test]
@@ -417,6 +451,23 @@ async fn a_confirmed_call_runs_and_its_result_reaches_the_model() {
         format!("{shown:?}").contains("the state was changed"),
         "{shown:?}"
     );
+}
+
+#[tokio::test]
+async fn a_confirmed_call_runs_in_the_turn_context() {
+    // The tool acts on the chat it was called in: the held call is run with the
+    // same context, so `ToolContext::chat` is the triggering chat, not empty.
+    let ran = Arc::new(AtomicBool::new(false));
+    let (agent, _llm, chat) = consequential_agent_with_chat(&ran);
+    let trigger = event("gA", ChatType::Group, "u1", "@bot change the state");
+    agent.ingest(&trigger).unwrap();
+    agent.respond(&trigger).await.unwrap();
+
+    let yes = event("gA", ChatType::Group, "u1", "yes");
+    agent.ingest(&yes).unwrap();
+    agent.respond(&yes).await.unwrap();
+
+    assert_eq!(chat.lock().unwrap().as_deref(), Some("gA"));
 }
 
 #[tokio::test]
@@ -508,6 +559,7 @@ async fn an_expired_pending_call_is_not_run() {
         llm,
         Arc::new(ToolRegistry::new(vec![Arc::new(ConsequentialTool {
             ran: Arc::clone(&ran),
+            chat: Arc::new(std::sync::Mutex::new(None)),
         })])),
         config,
     );

@@ -73,6 +73,36 @@ pub struct AgentConfig {
     pub memory_extract_max_memories: usize,
     /// How many memories a turn recalls into the prompt.
     pub memory_recall_top: usize,
+    /// How much a fact's lexical match with the question counts when ranking.
+    pub weight_similarity: f32,
+    /// How much a fact's recency counts when ranking.
+    pub weight_recency: f32,
+    /// How much a fact's judged importance counts when ranking.
+    pub weight_importance: f32,
+    /// How much the extraction's confidence counts when ranking.
+    pub weight_confidence: f32,
+    /// Whether a chat's facts are consolidated into reflections.
+    ///
+    /// The consolidation pass makes one model call to derive higher-level
+    /// insights from a chat's stored facts, once enough new facts have landed.
+    /// A quality feature, not a correctness one: a pass that stores nothing, or
+    /// a model that cannot be reached, simply leaves memory as it was.
+    pub reflection_enabled: bool,
+    /// How many new facts trigger a consolidation pass.
+    ///
+    /// A pass runs once this many facts have been stored since the last one, so
+    /// a chat is not asked to reflect on every new fact.
+    pub reflection_batch: usize,
+    /// The most existing facts a consolidation prompt shows.
+    pub reflection_max_facts: usize,
+    /// The most tokens a consolidation reply may use.
+    pub reflection_max_tokens: u32,
+    /// How similar two facts must be to count as duplicates, in `0.0..=1.0`.
+    ///
+    /// The consolidation step drops a newly extracted fact whose word overlap
+    /// with a live fact of the same kind reaches this. One disables dedup, zero
+    /// keeps only the first of everything.
+    pub dedup_threshold: f32,
     /// How many times the model may call tools before the loop stops.
     ///
     /// A bound, not a target: the model normally answers in one call, and a
@@ -134,6 +164,15 @@ impl Default for AgentConfig {
             memory_extract_tokens: 1_024,
             memory_extract_max_memories: 50,
             memory_recall_top: 8,
+            weight_similarity: 0.5,
+            weight_recency: 0.2,
+            weight_importance: 0.2,
+            weight_confidence: 0.1,
+            reflection_enabled: true,
+            reflection_batch: 10,
+            reflection_max_facts: 50,
+            reflection_max_tokens: 1_024,
+            dedup_threshold: 0.85,
             max_tool_iterations: 3,
             web_search_results: 5,
             web_search_max_chars: 4_000,
@@ -202,6 +241,23 @@ impl AgentConfig {
                 .unwrap_or(default.memory_extract_max_memories),
             memory_recall_top: env_usize("AGENT_MEMORY_RECALL_TOP")
                 .unwrap_or(default.memory_recall_top),
+            weight_similarity: env_f32("AGENT_WEIGHT_SIMILARITY")
+                .unwrap_or(default.weight_similarity),
+            weight_recency: env_f32("AGENT_WEIGHT_RECENCY").unwrap_or(default.weight_recency),
+            weight_importance: env_f32("AGENT_WEIGHT_IMPORTANCE")
+                .unwrap_or(default.weight_importance),
+            weight_confidence: env_f32("AGENT_WEIGHT_CONFIDENCE")
+                .unwrap_or(default.weight_confidence),
+            reflection_enabled: env_bool("AGENT_REFLECTION_ENABLED")
+                .unwrap_or(default.reflection_enabled),
+            reflection_batch: env_usize("AGENT_REFLECTION_BATCH")
+                .unwrap_or(default.reflection_batch),
+            reflection_max_facts: env_usize("AGENT_REFLECTION_MAX_FACTS")
+                .unwrap_or(default.reflection_max_facts),
+            reflection_max_tokens: env_usize("AGENT_REFLECTION_TOKENS")
+                .map(|tokens| tokens as u32)
+                .unwrap_or(default.reflection_max_tokens),
+            dedup_threshold: env_f32("AGENT_DEDUP_THRESHOLD").unwrap_or(default.dedup_threshold),
             max_tool_iterations: env_usize("AGENT_MAX_TOOL_ITERATIONS")
                 .unwrap_or(default.max_tool_iterations),
             web_search_results: env_usize("AGENT_WEB_SEARCH_RESULTS")
@@ -233,7 +289,8 @@ impl AgentConfig {
     /// and evaluation are off for the same reason: a test that is not about
     /// reasoning never spends a reply on a plan or a critique, and the tests
     /// that assert exact request counts stay exact. A reasoning test turns them
-    /// back on itself.
+    /// back on itself. Consolidation is off for the same reason: a test that is
+    /// not about reflections never spends a reply on one.
     pub fn for_test() -> Self {
         Self {
             store_dir: PathBuf::from(":memory:"),
@@ -242,6 +299,7 @@ impl AgentConfig {
             max_tool_iterations: 0,
             planner_enabled: false,
             max_revisions: 0,
+            reflection_enabled: false,
             ..Self::default()
         }
     }
@@ -286,6 +344,14 @@ impl AgentConfig {
 }
 
 fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
+/// Reads a fractional setting.
+///
+/// A ratio like a ranking weight or a similarity threshold is a real number, so
+/// it is parsed as one rather than rounded to an integer the way a count is.
+fn env_f32(key: &str) -> Option<f32> {
     std::env::var(key).ok()?.parse().ok()
 }
 
@@ -350,5 +416,23 @@ mod tests {
         assert_eq!(config.memory_extract_batch, usize::MAX);
         assert_eq!(config.memory_extract_idle, Duration::MAX);
         assert_eq!(config.memory_path(), PathBuf::from(":memory:"));
+    }
+
+    #[test]
+    fn for_test_never_consolidates() {
+        // The reflection pass is off under `for_test`, so a test that is not
+        // about reflections never spends a reply on one and the exact
+        // request-count assertions stay exact.
+        assert!(!AgentConfig::for_test().reflection_enabled);
+        assert!(AgentConfig::default().reflection_enabled);
+    }
+
+    #[test]
+    fn the_ranking_weights_have_the_designed_defaults() {
+        let config = AgentConfig::default();
+        assert_eq!(config.weight_similarity, 0.5);
+        assert_eq!(config.weight_recency, 0.2);
+        assert_eq!(config.weight_importance, 0.2);
+        assert_eq!(config.weight_confidence, 0.1);
     }
 }

@@ -205,9 +205,9 @@ hook is set, the framework subscribes to every event kind, not just `Messages`; 
 ## The AI agent
 
 > **Continuing the agent work? Read [`docs/AGENT.md`](docs/AGENT.md) first.** It
-> records what is built (milestones 1–3), the decisions that must not regress,
-> and the next milestones in order (milestone 4 is semantic memory). The
-> architecture below is the reference; `docs/AGENT.md` is the state and roadmap.
+> records what is built (milestones 1–9), the decisions that must not regress,
+> and where the work stands. The architecture below is the reference;
+> `docs/AGENT.md` is the state and roadmap.
 
 `crates/megumi-agent` is a **platform-agnostic** agent core (lib name `megumi_agent`); it never imports
 `whatsapp-rust`. `src/agent/` is the only place that knows both, converting `whatsapp_rust` messages into
@@ -217,7 +217,8 @@ record a trace. Modules:
 `event` (types), `config` (`AgentConfig`), `store` (per-chat JSON history, one file per chat, bounded
 window), `queues` (one turn at a time per chat), `gate` (pure trigger decision), `context` (the prompt
 builder and the `ReaderContext`/`Visibility` privacy boundary), `memory` (durable facts: `store` records +
-JSON store, `writer` extraction, `retrieval` ranking), `tools` (the `Tool` trait, `ToolRegistry`, and the
+JSON store, `writer` extraction, `reflection`/`consolidate` insights and dedup, `retrieval` ranking),
+`tools` (the `Tool` trait, `ToolRegistry`, and the
 `WebSearch` tool), `safety` (the output guard `screen_reply` and the confirmation gate
 `PendingConfirmations`), `reasoning` (the planner and the evaluator that bracket a turn), `llm` (the
 `LlmClient` trait, the Anthropic client, and test doubles), `trace`
@@ -258,6 +259,17 @@ confirmation narration turn is not planned or judged, and a silent reply is not 
 reads memory or takes a `ReaderContext`, so there is no new privacy surface; the revision reuses the turn's
 own prompt. `run_turn` calls the extracted `model_loop` for the turn and for each revision; the plan,
 revision count, and verdict are recorded on the `TurnTrace`.
+
+**Consolidation and reflections (milestone 9)** run in `respond` right after extraction:
+`memory::reflection::reflect_if_due` makes one model call once a chat has `reflection_batch` new live
+facts and stores higher-level insights as `MemoryKind::Reflection` records (`MemoryOp::Reflect`), each
+citing the fact ids it was derived from. A reflection's `visibility` and `valid_from` are set in code
+from the chat type and the cited facts, never by the model, and `render_memory` marks it `(insight) `
+so the model does not read an inference as a stated fact. `memory::consolidate::dedup_adds` drops a new
+fact whose lexical overlap with a live same-kind fact reaches `dedup_threshold`; it runs in the
+config-aware writer and reflection passes, never in `MemoryStore::apply`. The reflection pass has its own
+per-chat cursor (advanced on any model answer, so a NOOP does not re-fire), and the retrieval weights are
+now `AgentConfig` knobs. Reflections stay off in `for_test()` so exact-request-count tests are unchanged.
 
 Rules that are easy to break:
 

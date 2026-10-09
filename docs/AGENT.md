@@ -10,7 +10,7 @@ memory, context, reasoning, tools, safety, evals). We are implementing it in the
 milestones that spec lays out, and its own rule applies: **do not start a later
 milestone until the earlier one's exit criteria pass.**
 
-## What is built (milestones 1–3)
+## What is built (milestones 1–9)
 
 | Milestone | Status |
 |---|---|
@@ -22,7 +22,7 @@ milestone until the earlier one's exit criteria pass.**
 | 6. Safety layer (output guard, confirmation gates, injection suite) | **done** |
 | 7. Commands + rate limits (the deterministic command router) | **done** (`!ask`, `!summary`, `!memory`, `!forget`, `!remind`) |
 | 8. Planner/evaluator | **done** (plan before, evaluate + bounded revise after) |
-| 9. Consolidation, reflections, tuning | not started |
+| 9. Consolidation, reflections, tuning | **done** (reflections, dedup, tunable weights) |
 
 ### Where things live
 
@@ -30,7 +30,9 @@ milestone until the earlier one's exit criteria pass.**
   `whatsapp-rust` dependency. Modules: `event`, `config`, `store`, `queues`,
   `gate`, `context`, `memory/`, `llm/`, `trace`, `agent`.
 - `crates/megumi-agent/src/memory/` — durable facts: `store` (records + the JSON
-  store), `writer` (extraction), `retrieval` (ranking behind the privacy filter).
+  store), `writer` (extraction), `reflection` (consolidation into insights),
+  `consolidate` (duplicate suppression), `retrieval` (ranking behind the privacy
+  filter).
 - `crates/megumi-agent/src/tools.rs` — the `Tool` trait, the `ToolRegistry`, and
   the `WebSearch` tool.
 - `crates/megumi-agent/src/safety.rs` — the output guard, the confirmation gate,
@@ -46,9 +48,9 @@ milestone until the earlier one's exit criteria pass.**
   (mirrors `src/news/`).
 - `src/events.rs` — the single framework `event_handler`, fanning out to the news
   digest, the reminders, and the agent.
-- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,router,reasoning,live}.rs` —
-  end-to-end, eval, memory, tool-loop, prompt-injection, reasoning, and live smoke
-  tests.
+- `crates/megumi-agent/tests/{pipeline,eval,memory,tools,injection,router,reasoning,reflection,live}.rs` —
+  end-to-end, eval, memory, tool-loop, prompt-injection, reasoning, reflection,
+  and live smoke tests.
 
 ## Decisions that must not regress
 
@@ -136,7 +138,8 @@ through the existing `ReaderContext` boundary. Built in `crates/megumi-agent/src
 **v1 stands in for embeddings with lexical similarity.** The configured provider
 (Anthropic Messages API) has no embeddings endpoint, so `retrieval::similarity`
 compares words; replace that one function with a vector score when an eval needs
-it, and do not add a vector database before then.
+it, and do not add a vector database before then. The four ranking weights are no
+longer constants — milestone 9 moved them into `AgentConfig` (see below).
 
 **Do not regress:** the model never chooses `visibility` (the writer derives it
 from the chat type), and every fact must cite evidence message ids that are in
@@ -332,11 +335,76 @@ and evaluator must stay off in `AgentConfig::for_test()` — the tool and eval
 tests assert exact request counts, and a stray plan or verdict call would break
 them.
 
+## Milestone 9 — consolidation, reflections, tuning (done)
+
+Goal: let a chat's facts add up to higher-level knowledge, stop near-duplicate
+facts accumulating, and move the retrieval weights out of code. Built in
+`crates/megumi-agent/src/memory/{reflection,consolidate}.rs`, with the pass wired
+into `agent.rs` and the store and config extended:
+
+- `memory/store.rs` — `MemoryKind::{Fact, Reflection}` (externally tagged, no
+  fallback, defaulting to `Fact` so an old memory file still loads) and a
+  `MemoryRecord::kind`. `MemoryOp::Reflect(NewFact)` stores a reflection; its
+  `source_message_ids` name the **fact ids** it was derived from. `State` gained a
+  per-chat `reflection_cursor`, and `apply` was split into a private `apply_with`
+  so `apply` (extraction) and the new `apply_reflections` each move only their own
+  cursor, in one write.
+- `memory/reflection.rs::reflect_if_due` — one model call when a chat has
+  `reflection_batch` (10) new live facts. It shows the chat's live facts and asks
+  for `ADD`/`NOOP` insights; `validate_reflection` derives visibility from the
+  chat type and `valid_from` from the cited facts, and drops an op citing a fact
+  the chat does not have. The reply is parsed with the writer's shared
+  `parse_ops`. The cursor is the newest live fact id, advanced on any model answer
+  (including an unparseable one) but not on a transport failure, so a pass that
+  stores nothing does not re-fire every turn.
+- `memory/consolidate.rs::dedup_adds` — a pure lexical near-duplicate check
+  (Jaccard over lowercased word tokens, threshold `dedup_threshold`, default
+  0.85). It runs in the writer (before `apply`) and in the reflection pass, and
+  only ever drops an `Add`/`Reflect` against a live record **of the same kind**,
+  so a reflection paraphrasing a fact is kept. It is deliberately *not* in
+  `MemoryStore::apply`: dedup is a config-tuned heuristic and `apply` must stay a
+  predictable op-applier.
+- `memory/retrieval.rs` — the four ranking weights moved from `const`s into
+  `AgentConfig` (`weight_similarity` 0.5, `weight_recency` 0.2,
+  `weight_importance` 0.2, `weight_confidence` 0.1; env-overridable). This is the
+  "tuning" the milestone names.
+- `context.rs` — `RecalledMemory` gained `kind`, and `render_memory` marks a
+  reflection `(insight) ` so the model reads it as the agent's own inference, not
+  a stated fact. The `search_memory` tool renders it the same way.
+- Config knobs (env-overridable, defaults ON, `for_test` OFF):
+  `reflection_enabled` (`AGENT_REFLECTION_ENABLED`), `reflection_batch`
+  (`AGENT_REFLECTION_BATCH`, 10), `reflection_max_facts`
+  (`AGENT_REFLECTION_MAX_FACTS`, 50), `reflection_max_tokens`
+  (`AGENT_REFLECTION_TOKENS`), `dedup_threshold` (`AGENT_DEDUP_THRESHOLD`, 0.85),
+  and `AGENT_WEIGHT_{SIMILARITY,RECENCY,IMPORTANCE,CONFIDENCE}`. A new `env_f32`
+  helper parses the fractional settings without rounding them to integers.
+- `agent.rs::reflect_memory` runs right after `extract_memory` in `respond` and
+  `answer_command`, so a chat's new facts are reflected on with its older ones. A
+  failed pass is logged, never fatal.
+- Evals: `crates/megumi-agent/tests/reflection.rs` (enough facts store a
+  reflection citing them; an op citing an unknown fact is dropped; a private
+  reflection never reaches a group prompt; a duplicate the extraction proposes is
+  not stored twice; reflections off makes no call; a NOOP advances the cursor so
+  the pass does not re-fire), plus unit tests in `reflection.rs`,
+  `consolidate.rs`, `retrieval.rs`, `store.rs`, and `context.rs`.
+
+**Do not regress:** a reflection is a distinct kind, never a plain fact, and it is
+marked `(insight)` in the prompt so an inference is not read as ground truth. The
+model never sets a reflection's privilege or time — visibility comes from the chat
+type and `valid_from` from the cited facts, and evidence must cite live facts of
+this chat — so there is no new privacy surface and a private reflection cannot
+reach a group (retrieval still runs `reader.permits` first). Dedup lives in the
+config-aware pass, never in `apply`. The pass must stay off in
+`AgentConfig::for_test()`: the tool, reasoning, and router tests assert exact
+request counts, and a stray reflection call would break them.
+
 ## First steps in a new session
 
 1. Read `CLAUDE.md` (architecture) and this file (state + next steps).
 2. Read `crates/megumi-agent/src/{lib,agent,context,tools,safety,reasoning,store}.rs`
    to see the seams.
 3. Run `cargo test --workspace` to confirm a green baseline.
-4. Start milestone 9 (consolidation, reflections, tuning) — the next unfinished
-   milestone.
+4. Milestones 1–9 are done. The original design spec is not in the repo, so any
+   further work is a new interpretation: extend the evals, tune the reflection
+   and retrieval knobs against real traffic, or add a media-understanding
+   adapter for attachments (see the adapter's `attachments` seam).

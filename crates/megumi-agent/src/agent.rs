@@ -19,7 +19,7 @@ use crate::llm::{
     LlmClient, LlmError, LlmMessage, LlmRequest, LlmToolCall, LlmToolResult, ToolSpec,
 };
 use crate::memory::store::{MemoryOp, MemoryRecord};
-use crate::memory::{MemoryStore, retrieval, writer};
+use crate::memory::{MemoryStore, reflection, retrieval, writer};
 use crate::queues::ChatQueues;
 use crate::reasoning::{self, Usage};
 use crate::safety::{self, Confirmation, PendingConfirmations, PendingToolCall};
@@ -113,6 +113,9 @@ impl Agent {
         // every message, so a busy group that never triggers the agent still
         // turns its messages into facts before the message window prunes them.
         self.extract_memory(event).await;
+        // Consolidate after extracting, so this pass sees the facts the one
+        // before it just added.
+        self.reflect_memory(event).await;
 
         // A reply to a tool confirmation is resolved before the gate: a bare
         // "yes" would otherwise be an acknowledgement in a private chat or a
@@ -180,6 +183,25 @@ impl Agent {
         }
     }
 
+    /// Runs the consolidation pass for `event`'s chat, if one is due.
+    ///
+    /// Called right after extraction, so a chat's new facts are reflected on
+    /// together with the older ones. Like extraction, a failed pass is logged,
+    /// never fatal: memory is a background concern, the reply is not.
+    async fn reflect_memory(&self, event: &InboundEvent) {
+        if let Err(error) = reflection::reflect_if_due(
+            self.llm.as_ref(),
+            &self.memory,
+            &self.config,
+            &event.chat,
+            event.chat_type,
+        )
+        .await
+        {
+            warn!(chat = %event.chat, %error, "the consolidation pass failed");
+        }
+    }
+
     /// Runs a turn because a command asked for one, bypassing the gate.
     ///
     /// A command message is `is_command`, so [`gate::decide`] stays silent on it
@@ -195,6 +217,7 @@ impl Agent {
     ) -> Result<Option<OutboundAction>, crate::Error> {
         let _guard = self.queues.lock(&event.chat).await;
         self.extract_memory(event).await;
+        self.reflect_memory(event).await;
         self.run_turn(event, Trigger::Command, Vec::new(), Vec::new(), true)
             .await
     }

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AgentConfig;
 use crate::event::{ChatId, ChatType, InboundEvent, SenderId};
+use crate::memory::store::MemoryKind;
 use crate::store::StoredMessage;
 
 /// Who is reading, and what they are allowed to see.
@@ -61,6 +62,8 @@ pub enum Visibility {
 /// A memory as retrieval would hand it back, before the reader filter.
 #[derive(Clone, Debug)]
 pub struct RecalledMemory {
+    /// Whether this is a stated fact or a derived insight.
+    pub kind: MemoryKind,
     /// The fact, self-contained and in the third person.
     pub content: String,
     /// Where it may be shown.
@@ -320,11 +323,16 @@ fn system_prompt(chat_type: ChatType, trigger: &InboundEvent) -> String {
 /// One recalled fact as a prompt line, with the window it held when superseded.
 ///
 /// A superseded fact is only recalled for a question about the past; the window
-/// it held is named so the model does not read it as current. Shared with the
-/// `search_memory` tool so a fact reads the same whether it arrives in the
-/// prompt or through a tool call.
+/// it held is named so the model does not read it as current. A reflection is
+/// marked `(insight)` so the model reads it as the agent's own inference rather
+/// than something a participant stated. Shared with the `search_memory` tool so
+/// a fact reads the same whether it arrives in the prompt or through a tool
+/// call.
 pub(crate) fn render_memory(memory: &RecalledMemory) -> String {
     let mut line = String::from("- ");
+    if memory.kind == MemoryKind::Reflection {
+        line.push_str("(insight) ");
+    }
     if let Some(until) = memory.valid_to {
         line.push_str("(no longer true as of ");
         line.push_str(&until.date_naive().to_string());
@@ -421,6 +429,7 @@ mod tests {
 
     fn memory(visibility: Visibility, origin: &str) -> RecalledMemory {
         RecalledMemory {
+            kind: MemoryKind::Fact,
             content: "fact".into(),
             visibility,
             origin_chat: ChatId::new(origin),
@@ -489,6 +498,14 @@ mod tests {
     }
 
     #[test]
+    fn a_reflection_is_marked_as_an_insight() {
+        let mut memory = memory(Visibility::Chat, "gA");
+        assert!(!render_memory(&memory).contains("(insight)"));
+        memory.kind = MemoryKind::Reflection;
+        assert!(render_memory(&memory).contains("(insight)"));
+    }
+
+    #[test]
     fn the_system_prompt_is_byte_identical_across_turns() {
         let config = AgentConfig::for_test();
         let builder = ContextBuilder::new(&config);
@@ -543,6 +560,7 @@ mod tests {
         let config = AgentConfig::for_test();
         let builder = ContextBuilder::new(&config);
         let private = RecalledMemory {
+            kind: MemoryKind::Fact,
             content: "CANARY-private-dm-secret".into(),
             visibility: Visibility::Private,
             origin_chat: ChatId::new("dm"),
@@ -579,6 +597,7 @@ mod tests {
         let config = AgentConfig::for_test();
         let builder = ContextBuilder::new(&config);
         let memories = vec![RecalledMemory {
+            kind: MemoryKind::Fact,
             content: "CANARY-group-a-secret".into(),
             visibility: Visibility::Chat,
             origin_chat: ChatId::new("gA"),

@@ -21,7 +21,8 @@
 //! - `gate` - the pure decision of whether a message is answered
 //! - `context` - the layered, token-budgeted prompt builder, and the
 //!   [`ReaderContext`]/[`Visibility`] privacy boundary
-//! - `memory` - durable facts: the store, the extraction writer, and retrieval
+//! - `memory` - durable facts: the store, the extraction writer, the
+//!   consolidation/reflection passes, and retrieval
 //! - `llm` - the [`LlmClient`] trait, the Anthropic client, and test doubles
 //! - `tools` - the [`Tool`] trait, [`ToolRegistry`], and the web-search tool
 //! - `safety` - the output guard and the confirmation gate for tools
@@ -62,7 +63,7 @@ pub use llm::{
     AnthropicLlm, DisabledLlm, LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse,
     LlmToolCall, LlmToolResult, ScriptedLlm, ToolSpec,
 };
-pub use memory::{MemoryOp, MemoryRecord, MemoryStore};
+pub use memory::{MemoryKind, MemoryOp, MemoryRecord, MemoryStore};
 pub use queues::ChatQueues;
 pub use safety::{Confirmation, PendingConfirmations, PendingToolCall};
 pub use store::{MessageStore, StoredMessage};

@@ -6,18 +6,22 @@
 //! from), bi-temporal validity (when it was true, and whether it still is), and
 //! a [`Visibility`](crate::context::Visibility) label.
 //!
-//! The three pieces are separate so each is testable on its own:
+//! The pieces are separate so each is testable on its own:
 //!
 //! - `store` - [`MemoryRecord`], [`MemoryOp`], and the [`MemoryStore`]
 //! - `writer` - extracting new facts from a chat's messages with the model
+//! - `reflection` - consolidating a chat's facts into higher-level insights
+//! - `consolidate` - dropping a new fact the store already knows
 //! - `retrieval` - ranking the facts a reader may see for a question
 //!
 //! Retrieval filters through the same [`ReaderContext`](crate::context::ReaderContext)
 //! boundary the context builder uses, so a private fact cannot reach a group
 //! through memory any more than through the message window.
 
+pub mod consolidate;
+pub mod reflection;
 pub mod retrieval;
 pub mod store;
 pub mod writer;
 
-pub use store::{MemoryOp, MemoryRecord, MemoryStore};
+pub use store::{MemoryKind, MemoryOp, MemoryRecord, MemoryStore};

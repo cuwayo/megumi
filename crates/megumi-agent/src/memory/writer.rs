@@ -23,12 +23,14 @@ use crate::config::AgentConfig;
 use crate::context::{Visibility, escape, strip_code_fence, truncate};
 use crate::event::{ChatId, ChatType, SenderId};
 use crate::llm::{LlmClient, LlmError, LlmRequest};
+use crate::memory::consolidate;
 use crate::memory::store::{MemoryOp, MemoryRecord, MemoryStore, NewFact};
 use crate::store::{MessageStore, StoredMessage};
 
 /// The longest a stored fact may be, in characters. A model that rambles is
 /// truncated rather than dropped, so a useful fact is not lost to length.
-const MAX_CONTENT_CHARS: usize = 500;
+/// Shared with the reflection pass, which caps an insight the same way.
+pub(crate) const MAX_CONTENT_CHARS: usize = 500;
 
 /// Runs an extraction pass for `chat` when one is due.
 ///
@@ -88,6 +90,17 @@ pub async fn extract_if_due(
         .into_iter()
         .filter_map(|raw| validate_op(raw, chat_type, &by_id, &existing_ids))
         .collect();
+    // Drop an add the chat already knows. The dedup compares against every live
+    // record, not just the capped `existing` the prompt showed, so a duplicate
+    // the prompt could not fit is still caught.
+    let live = memory
+        .records()?
+        .into_iter()
+        .filter(|record| {
+            record.origin_chat == *chat && record.valid_to.is_none() && !record.forgotten
+        })
+        .collect::<Vec<_>>();
+    let ops = consolidate::dedup_adds(ops, &live, config.dedup_threshold);
 
     let cursor = pending.last().map(|message| message.message_id.clone());
     memory.apply(chat, &ops, cursor)
@@ -169,15 +182,8 @@ fn extraction_prompt(
 
     let mut user = String::new();
     if !existing.is_empty() {
-        user.push_str("<stored_facts>\n");
-        for record in existing {
-            user.push_str("<fact id=\"");
-            user.push_str(&escape(&record.id));
-            user.push_str("\">");
-            user.push_str(&escape(&record.content));
-            user.push_str("</fact>\n");
-        }
-        user.push_str("</stored_facts>\n\n");
+        user.push_str(&render_facts(existing));
+        user.push_str("\n\n");
     }
     user.push_str("<recent_messages>\n");
     for message in pending {
@@ -195,23 +201,40 @@ fn extraction_prompt(
     (system, user)
 }
 
+/// The `<stored_facts>` block: each record's id and content, escaped.
+///
+/// Shared with the reflection pass, which shows a chat's facts the same way so
+/// the model targets them by id the same way in either prompt.
+pub(crate) fn render_facts(records: &[MemoryRecord]) -> String {
+    let mut block = String::from("<stored_facts>\n");
+    for record in records {
+        block.push_str("<fact id=\"");
+        block.push_str(&escape(&record.id));
+        block.push_str("\">");
+        block.push_str(&escape(&record.content));
+        block.push_str("</fact>\n");
+    }
+    block.push_str("</stored_facts>");
+    block
+}
+
 /// One operation as the model wrote it, before validation.
 #[derive(Deserialize)]
-struct RawOp {
+pub(crate) struct RawOp {
     #[serde(default)]
-    op: String,
+    pub(crate) op: String,
     #[serde(default)]
-    content: Option<String>,
+    pub(crate) content: Option<String>,
     #[serde(default)]
-    target: Option<String>,
+    pub(crate) target: Option<String>,
     #[serde(default)]
-    subject: Option<String>,
+    pub(crate) subject: Option<String>,
     #[serde(default)]
-    confidence: Option<f32>,
+    pub(crate) confidence: Option<f32>,
     #[serde(default)]
-    importance: Option<f32>,
+    pub(crate) importance: Option<f32>,
     #[serde(default)]
-    evidence: Vec<String>,
+    pub(crate) evidence: Vec<String>,
 }
 
 /// The JSON array in a model reply, however it was wrapped.
@@ -219,8 +242,9 @@ struct RawOp {
 /// The prompt asks for a bare array, but a model may fence it in a code block or
 /// add a sentence around it, so the fence is stripped and, failing a direct
 /// parse, the widest bracketed slice is tried. `None` means nothing parseable,
-/// which the caller treats as "no facts this pass".
-fn parse_ops(text: &str) -> Option<Vec<RawOp>> {
+/// which the caller treats as "no facts this pass". Shared with the reflection
+/// pass, whose reply has the same shape.
+pub(crate) fn parse_ops(text: &str) -> Option<Vec<RawOp>> {
     let body = strip_code_fence(text);
     if let Ok(ops) = serde_json::from_str::<Vec<RawOp>>(body) {
         return Some(ops);

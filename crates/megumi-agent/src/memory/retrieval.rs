@@ -7,14 +7,14 @@
 //!
 //! The rank is a weighted sum of four signals: how well the fact matches the
 //! question, how recent it is, how important it was judged, and how confident
-//! the extraction was. The weights are constants here, not configuration: they
-//! are a starting point the design's evals will tune, and moving them into
-//! [`AgentConfig`](crate::config::AgentConfig) before there is evidence for
-//! specific values would be guessing in a more elaborate way.
+//! the extraction was. The weights live in [`AgentConfig`](crate::config::AgentConfig)
+//! (`weight_similarity`, `weight_recency`, `weight_importance`,
+//! `weight_confidence`) so the tuning milestone can adjust them from the
+//! environment without a rebuild; the defaults are the starting point.
 //!
 //! "Match" is lexical overlap, not an embedding. The configured provider is the
 //! Anthropic Messages API, which has no embeddings endpoint, so v1 compares
-//! words and a later milestone can replace [`similarity`] with a vector score
+//! words and a later change can replace [`similarity`] with a vector score
 //! without touching the callers. `docs/AGENT.md` records that seam.
 
 use chrono::{DateTime, Utc};
@@ -22,15 +22,6 @@ use chrono::{DateTime, Utc};
 use crate::config::AgentConfig;
 use crate::context::{ReaderContext, RecalledMemory};
 use crate::memory::store::{MemoryRecord, MemoryStore};
-
-/// How much a fact's lexical match with the question counts.
-const W_SIMILARITY: f32 = 0.5;
-/// How much a fact's recency counts.
-const W_RECENCY: f32 = 0.2;
-/// How much a fact's judged importance counts.
-const W_IMPORTANCE: f32 = 0.2;
-/// How much the extraction's confidence counts.
-const W_CONFIDENCE: f32 = 0.1;
 
 /// Words that mark a question as being about the past.
 ///
@@ -74,10 +65,10 @@ pub fn search(
         .filter(|record| !record.forgotten)
         .filter(|record| record.valid_to.is_none() || include_past)
         .map(|record| {
-            let score = W_SIMILARITY * similarity(query, &record.content)
-                + W_RECENCY * recency(record.valid_from, now)
-                + W_IMPORTANCE * record.importance
-                + W_CONFIDENCE * record.confidence;
+            let score = config.weight_similarity * similarity(query, &record.content)
+                + config.weight_recency * recency(record.valid_from, now)
+                + config.weight_importance * record.importance
+                + config.weight_confidence * record.confidence;
             (score, record)
         })
         .collect();
@@ -145,6 +136,7 @@ pub fn list(
 /// A record as the context builder takes it, before the reader filter.
 fn recalled(record: &MemoryRecord) -> RecalledMemory {
     RecalledMemory {
+        kind: record.kind,
         content: record.content.clone(),
         visibility: record.visibility,
         origin_chat: record.origin_chat.clone(),
@@ -336,6 +328,40 @@ mod tests {
         assert_eq!(similarity("!!!", "anything"), 0.0);
         assert_eq!(similarity("the venue", "the venue is here"), 1.0);
         assert_eq!(similarity("the venue", "nothing relevant"), 0.0);
+    }
+
+    #[test]
+    fn the_ranking_weights_come_from_the_config() {
+        // Two facts with identical recency and confidence; only importance and
+        // similarity differ. With similarity weighted and importance zeroed, the
+        // lexical match wins — proving the weights are read, not hard-coded.
+        let store = MemoryStore::open(":memory:").unwrap();
+        let chat = ChatId::new("gA");
+        store
+            .apply(
+                &chat,
+                &[MemoryOp::Add(fact(
+                    "the venue is the old hall",
+                    Visibility::Chat,
+                    None,
+                ))],
+                None,
+            )
+            .unwrap();
+        let mut high_importance = fact("something unrelated entirely", Visibility::Chat, None);
+        high_importance.importance = 1.0;
+        store
+            .apply(&chat, &[MemoryOp::Add(high_importance)], None)
+            .unwrap();
+
+        let mut config = AgentConfig::for_test();
+        config.weight_similarity = 1.0;
+        config.weight_recency = 0.0;
+        config.weight_importance = 0.0;
+        config.weight_confidence = 0.0;
+        let group = reader(ChatType::Group, "gA", &["gA"]);
+        let ranked = search(&group, "the venue", &store, &config, Utc::now()).unwrap();
+        assert_eq!(ranked[0].content, "the venue is the old hall");
     }
 
     #[test]
